@@ -321,3 +321,32 @@ describe('AppService memory capability', () => {
     );
   });
 });
+
+describe('AppService theme', () => {
+  /**
+   * The server forwards a theme and interprets none of it. Validation and
+   * resolution belong to `@librechat/client`, which owns the token vocabulary; an
+   * AppConfig that filtered or normalised a theme here would be a second opinion
+   * about what a theme is, in the package least able to keep up with the design
+   * system.
+   */
+  const theme = {
+    version: 1,
+    name: 'cypher',
+    modes: { light: { colors: { 'rgb-accent-primary': '13 110 253' } } },
+  };
+
+  it('forwards a configured theme onto the app config', async () => {
+    const config = { theme } as DeepPartial<TCustomConfig>;
+
+    const result = await AppService({ config });
+
+    expect(result.theme).toEqual(theme);
+  });
+
+  it('leaves the theme undefined when none is configured', async () => {
+    const result = await AppService({ config: {} as DeepPartial<TCustomConfig> });
+
+    expect(result.theme).toBeUndefined();
+  });
+});

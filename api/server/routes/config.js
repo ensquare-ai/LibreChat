@@ -240,6 +240,15 @@ router.get('/', async function (req, res) {
         }
       }
 
+      /**
+       * The sign-in screen is the first thing a prospect sees, so the theme has
+       * to travel before there is a user. It is deployment configuration rather
+       * than anything about the caller, which is what makes it safe to send here.
+       */
+      if (baseConfig?.theme) {
+        payload.theme = baseConfig.theme;
+      }
+
       const unauthBuildInfo = buildBuildInfoPayload(interfaceConfig);
       if (unauthBuildInfo) {
         payload.buildInfo = unauthBuildInfo;
@@ -289,6 +298,8 @@ router.get('/', async function (req, res) {
       sharedLinksSnapshotFilesEnabled: sharedLinksEnabled && isFileSnapshotEnabled(appConfig),
       socialLogins: appConfig?.registration?.socialLogins ?? defaultSocialLogins,
       interface: appConfig?.interfaceConfig,
+      /** Forwarded, not interpreted. The client validates it — see the loader. */
+      ...(appConfig?.theme ? { theme: appConfig.theme } : {}),
       titleGenerationTiming: resolveTitleTiming({
         appConfig,
         endpoint: EModelEndpoint.agents,

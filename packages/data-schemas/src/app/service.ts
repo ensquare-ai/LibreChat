@@ -193,6 +193,9 @@ export const AppService = async (params?: {
     availableTools,
     imageOutputType,
     interfaceConfig,
+    /** Forwarded as configured. The client validates and resolves it — see
+     *  `validateThemeDefinition`; nothing on the server interprets a theme. */
+    theme: config?.theme,
     turnstileConfig,
     mcpConfig: mcpServersConfig,
     fileStrategies: config.fileStrategies,
