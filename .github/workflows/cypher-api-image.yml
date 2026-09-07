@@ -139,10 +139,16 @@ jobs:
       - name: Report the digest to pin
         run: |
           set -euo pipefail
-          read -r MEDIA_TYPE DIGEST < <(
+          # Command substitution rather than `read`: `imagetools inspect --format`
+          # emits no trailing newline, and `read` reports failure at EOF even once it
+          # has assigned every variable — which under `set -e` fails the step after the
+          # work has already succeeded.
+          INSPECTED=$(
             docker buildx imagetools inspect "${IMAGE}:${GITHUB_SHA}" \
               --format '{{.Manifest.MediaType}} {{.Manifest.Digest}}'
           )
+          MEDIA_TYPE=${INSPECTED%% *}
+          DIGEST=${INSPECTED##* }
           if [ "$MEDIA_TYPE" != "application/vnd.oci.image.index.v1+json" ]; then
             echo "::error::expected an image index, got ${MEDIA_TYPE} — the pin would be single-platform"
             exit 1
