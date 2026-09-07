@@ -90,6 +90,8 @@ export interface AppConfig {
   imageOutputType: string;
   /** Interface configuration */
   interfaceConfig?: TCustomConfig['interface'];
+  /** The deployment's theme, forwarded to the client untouched */
+  theme?: TCustomConfig['theme'];
   /** Turnstile configuration */
   turnstileConfig?: Partial<TCustomConfig['turnstile']>;
   /** Balance configuration */

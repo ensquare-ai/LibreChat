@@ -1784,6 +1784,54 @@ export enum RetentionMode {
   TEMPORARY = 'temporary',
 }
 
+/**
+ * A theme definition, as `librechat.yaml` may carry one.
+ *
+ * Structural only, and deliberately so. `validateThemeDefinition` in
+ * `@librechat/client` is the authority on whether a theme is *valid* — which
+ * colour tokens exist, which appearance tokens exist, what an RGB triple looks
+ * like — and this schema does not restate any of it. A second definition of
+ * validity in a second package is a second thing to drift, and the tokens move
+ * with the design system rather than with the configuration format.
+ *
+ * What this schema is for is narrower and still necessary: the top-level config
+ * is parsed with `.strict()` and an unknown key calls `process.exit(1)`, so
+ * without a `theme` key here a themed `librechat.yaml` does not boot at all.
+ * Verified on the built image — a `theme` key produced
+ * `Unrecognized key(s) in object: 'theme'` and exit 1.
+ *
+ * So the split is: this rejects a theme that is not shaped like a theme, at
+ * boot, where a typo should stop a deployment. The client's validator rejects a
+ * theme whose *tokens* are wrong, at load, where the remedy is to leave the
+ * bundled default rendering rather than to take the interface down.
+ *
+ * `passthrough` on the mode object for the same reason: the fields inside a mode
+ * belong to the design system, and enumerating them here would make every new
+ * token a change in two packages.
+ */
+export const themeModeDefinitionSchema = z
+  .object({
+    colors: z.record(z.string()).optional(),
+    appearance: z.record(z.string()).optional(),
+    brands: z.record(z.string()).optional(),
+  })
+  .passthrough();
+
+export const themeSchema = z
+  .object({
+    /** Only version 1 exists. A future version is a client that knows about it. */
+    version: z.literal(1),
+    name: z.string().min(1),
+    modes: z
+      .object({
+        light: themeModeDefinitionSchema.optional(),
+        dark: themeModeDefinitionSchema.optional(),
+      })
+      .strict(),
+    brands: z.record(z.string()).optional(),
+  })
+  .strict();
+
 export const interfaceSchema = z
   .object({
     privacyPolicy: z
@@ -2026,6 +2074,19 @@ export type EndpointsDropParamsMap = Record<string, string[] | Record<string, st
 
 export type TStartupConfig = {
   appTitle: string;
+  /**
+   * The deployment's theme, straight from `librechat.yaml`.
+   *
+   * Present in the pre-login payload as well as the authenticated one: the sign-in
+   * screen is the first thing a prospect sees, and a product that only becomes
+   * itself after login is branded in the wrong half.
+   *
+   * Typed loosely on purpose — `ThemeDefinition` lives in `@librechat/client`, and
+   * a server type that imported it would put React on the API's dependency graph
+   * to describe a payload it only forwards. The client narrows it at the loader,
+   * which is also where it is validated.
+   */
+  theme?: Record<string, unknown>;
   socialLogins?: string[];
   langfuseFanoutEnabled?: boolean;
   langfuseConnectionAccess?: boolean;
@@ -2624,6 +2685,13 @@ export const configSchema = z.object({
     })
     .optional(),
   interface: interfaceSchema,
+  /**
+   * The theme the deployment carries, as data. ADR-0001's reason for its
+   * existence: a theme built as a fork edit spends diff budget every week in
+   * the files most likely to conflict, and loaded from configuration it costs
+   * nothing after the loader lands once.
+   */
+  theme: themeSchema.optional(),
   turnstile: turnstileSchema.optional(),
   fileStrategy: fileStorageSchema.default(FileSources.local),
   fileStrategies: fileStrategiesSchema,

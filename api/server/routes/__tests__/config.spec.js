@@ -900,3 +900,45 @@ describe('GET /api/config', () => {
     });
   });
 });
+
+describe('theme', () => {
+  /**
+   * The theme has to arrive before there is a user. The sign-in screen is the first
+   * thing a prospect sees, and a product that only becomes itself after login is
+   * branded in the wrong half.
+   */
+  const theme = {
+    version: 1,
+    name: 'cypher',
+    modes: { light: { colors: { 'rgb-accent-primary': '13 110 253' } } },
+  };
+
+  it('ships the theme in the unauthenticated payload', async () => {
+    mockGetAppConfig.mockResolvedValue({ ...baseAppConfig, theme });
+    const app = createApp(null);
+
+    const response = await request(app).get('/api/config');
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body.theme).toEqual(theme);
+  });
+
+  it('ships the theme in the authenticated payload', async () => {
+    mockGetAppConfig.mockResolvedValue({ ...baseAppConfig, theme });
+    const app = createApp(mockUser);
+
+    const response = await request(app).get('/api/config');
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body.theme).toEqual(theme);
+  });
+
+  it('omits the key entirely when no theme is configured', async () => {
+    mockGetAppConfig.mockResolvedValue(baseAppConfig);
+    const app = createApp(mockUser);
+
+    const response = await request(app).get('/api/config');
+
+    expect(response.body).not.toHaveProperty('theme');
+  });
+});
