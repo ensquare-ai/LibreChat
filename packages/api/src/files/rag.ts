@@ -10,6 +10,12 @@ interface DeleteRagFileParams {
     file_id: string;
     embedded?: boolean;
   };
+  /**
+   * The agent the file was embedded under, when it was uploaded as an agent tool resource.
+   * The RAG API files such embeddings under the agent's id rather than the uploader's, and
+   * only finds them again when the delete names the same id. Sent as `entity_id`.
+   */
+  entityId?: string | null;
 }
 
 /**
@@ -20,9 +26,14 @@ interface DeleteRagFileParams {
  * @param params - The parameters object.
  * @param params.userId - The user ID for authentication.
  * @param params.file - The file object. Must have `embedded` and `file_id` properties.
+ * @param params.entityId - The agent id the file was embedded under, if any.
  * @returns Returns true if deletion was successful or skipped, false if there was an error.
  */
-export async function deleteRagFile({ userId, file }: DeleteRagFileParams): Promise<boolean> {
+export async function deleteRagFile({
+  userId,
+  file,
+  entityId,
+}: DeleteRagFileParams): Promise<boolean> {
   if (!file.embedded || !process.env.RAG_API_URL) {
     return true;
   }
@@ -41,6 +52,7 @@ export async function deleteRagFile({ userId, file }: DeleteRagFileParams): Prom
         'Content-Type': 'application/json',
         accept: 'application/json',
       },
+      ...(entityId ? { params: { entity_id: entityId } } : {}),
       data: [file.file_id],
     });
     logger.debug(`[deleteRagFile] Successfully deleted document ${file.file_id} from RAG API`);
