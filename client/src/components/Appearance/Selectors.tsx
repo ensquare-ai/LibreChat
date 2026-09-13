@@ -1,5 +1,6 @@
 import { useRecoilValue } from 'recoil';
 import { Dropdown, Spinner } from '@librechat/client';
+import { isOfferedLocale } from '~/locales/i18n';
 import { useLocalize } from '~/hooks';
 import { cn } from '~/utils';
 import store from '~/store';
@@ -65,7 +66,7 @@ export const LangSelector = ({
   const localize = useLocalize();
   const isLanguageLoading = useRecoilValue(store.languageLoading);
 
-  const languageOptions = [
+  const allLanguageOptions = [
     { value: 'auto', label: localize('com_nav_lang_auto') },
     { value: 'en-US', label: localize('com_nav_lang_english') },
     { value: 'zh-Hans', label: localize('com_nav_lang_chinese') },
@@ -110,6 +111,9 @@ export const LangSelector = ({
     { value: 'bo', label: localize('com_nav_lang_tibetan') },
     { value: 'uk-UA', label: localize('com_nav_lang_ukrainian') },
   ];
+  const languageOptions = allLanguageOptions.filter(
+    ({ value }) => value === 'auto' || isOfferedLocale(value),
+  );
 
   const labelId = 'language-selector-label';
 
