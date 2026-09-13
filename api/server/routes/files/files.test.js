@@ -45,6 +45,7 @@ jest.mock('sharp', () =>
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   refreshS3FileUrls: jest.fn(),
+  deleteRagFile: jest.fn().mockResolvedValue(true),
   getCodeExecutionBaseUrl: jest.fn((profile, environment) => {
     if (environment?.baseURL) {
       return environment.baseURL;
@@ -73,7 +74,7 @@ jest.mock('~/config', () => ({
 
 const { processDeleteRequest } = require('~/server/services/Files/process');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
-const { createCodeExecutionRouteKey } = require('@librechat/api');
+const { createCodeExecutionRouteKey, deleteRagFile } = require('@librechat/api');
 
 // Import the router after mocks
 const router = require('./files');
@@ -322,9 +323,101 @@ describe('File Routes - Delete with Agent Access', () => {
       expect(response.status).toBe(200);
       expect(response.body.message).toBe('File associations removed successfully from agent');
       expect(processDeleteRequest).not.toHaveBeenCalled();
+      expect(deleteRagFile).not.toHaveBeenCalled();
 
       const updatedAgent = await Agent.findOne({ id: agent.id }).lean();
       expect(updatedAgent.tool_resources.file_search.file_ids).toEqual([]);
+    });
+
+    it('removes the embeddings filed under the agent when an embedded file leaves file_search', async () => {
+      const embeddedFileId = uuidv4();
+      await createFile({
+        user: otherUserId,
+        file_id: embeddedFileId,
+        filename: 'embedded.txt',
+        filepath: '/uploads/embedded.txt',
+        bytes: 100,
+        type: 'text/plain',
+        embedded: true,
+      });
+      const agent = await createAgent({
+        id: uuidv4(),
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: otherUserId,
+        tool_resources: {
+          file_search: {
+            file_ids: [embeddedFileId, fileId],
+          },
+        },
+      });
+
+      const response = await request(app)
+        .delete('/files')
+        .send({
+          agent_id: agent.id,
+          tool_resource: 'file_search',
+          files: [
+            { file_id: embeddedFileId, filepath: '/uploads/embedded.txt' },
+            { file_id: fileId, filepath: '/uploads/test.txt' },
+          ],
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.message).toBe('File associations removed successfully from agent');
+      expect(processDeleteRequest).not.toHaveBeenCalled();
+
+      /** The embeddings are the agent's, so the delete names the agent; the file that was
+       * never embedded asks the RAG API for nothing. */
+      expect(deleteRagFile).toHaveBeenCalledTimes(1);
+      expect(deleteRagFile).toHaveBeenCalledWith({
+        userId: otherUserId.toString(),
+        file: expect.objectContaining({ file_id: embeddedFileId, embedded: true }),
+        entityId: agent.id,
+      });
+
+      /** The record is still the owner's: unlinking is not deletion. */
+      const record = await File.findOne({ file_id: embeddedFileId }).lean();
+      expect(record).not.toBeNull();
+      const updatedAgent = await Agent.findOne({ id: agent.id }).lean();
+      expect(updatedAgent.tool_resources.file_search.file_ids).toEqual([]);
+    });
+
+    it('leaves embeddings alone when the file leaves a tool resource other than file_search', async () => {
+      const embeddedFileId = uuidv4();
+      await createFile({
+        user: otherUserId,
+        file_id: embeddedFileId,
+        filename: 'embedded.txt',
+        filepath: '/uploads/embedded.txt',
+        bytes: 100,
+        type: 'text/plain',
+        embedded: true,
+      });
+      const agent = await createAgent({
+        id: uuidv4(),
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: otherUserId,
+        tool_resources: {
+          context: {
+            file_ids: [embeddedFileId],
+          },
+        },
+      });
+
+      const response = await request(app)
+        .delete('/files')
+        .send({
+          agent_id: agent.id,
+          tool_resource: 'context',
+          files: [{ file_id: embeddedFileId, filepath: '/uploads/embedded.txt' }],
+        });
+
+      expect(response.status).toBe(200);
+      expect(deleteRagFile).not.toHaveBeenCalled();
     });
 
     it('rejects invalid agent tool_resource values before unlinking', async () => {

@@ -1,6 +1,5 @@
 import axios from 'axios';
 import { logger } from '@librechat/data-schemas';
-import { FileContext } from 'librechat-data-provider';
 import { generateShortLivedToken } from '~/crypto/jwt';
 
 interface DeleteRagFileParams {
@@ -10,18 +9,14 @@ interface DeleteRagFileParams {
   file: {
     file_id: string;
     embedded?: boolean;
-    context?: string;
   };
   /**
    * The agent the file was embedded under, when it was uploaded as an agent tool resource.
    * The RAG API files such embeddings under the agent's id rather than the uploader's, and
-   * only finds them again when the delete names the same id.
+   * only finds them again when the delete names the same id. Sent as `entity_id`.
    */
   entityId?: string | null;
 }
-
-const isAgentFile = (file: DeleteRagFileParams['file']): boolean =>
-  file.context === FileContext.agents;
 
 /**
  * Deletes embedded document(s) from the RAG API.
@@ -64,19 +59,14 @@ export async function deleteRagFile({
     return true;
   } catch (error) {
     const axiosError = error as { response?: { status?: number }; message?: string };
-    if (axiosError.response?.status !== 404) {
+    if (axiosError.response?.status === 404) {
+      logger.warn(
+        `[deleteRagFile] Document ${file.file_id} not found in RAG API, may have been deleted already`,
+      );
+      return true;
+    } else {
       logger.error('[deleteRagFile] Error deleting document from RAG API:', axiosError.message);
       return false;
     }
-    if (isAgentFile(file) && !entityId) {
-      logger.error(
-        `[deleteRagFile] Document ${file.file_id} is an agent file and the delete named no agent; its embeddings remain in the RAG API`,
-      );
-      return false;
-    }
-    logger.warn(
-      `[deleteRagFile] Document ${file.file_id} not found in RAG API, may have been deleted already`,
-    );
-    return true;
   }
 }

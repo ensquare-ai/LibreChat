@@ -92,21 +92,6 @@ describe('deleteRagFile', () => {
       expect(config).not.toHaveProperty('params');
     });
 
-    it('should report orphaned embeddings when an agent file is deleted without naming its agent', async () => {
-      const file = { file_id: 'file-agent', embedded: true, context: 'agents' };
-      const error = new Error('Not Found') as Error & { response?: { status?: number } };
-      error.response = { status: 404 };
-      mockedAxios.delete.mockRejectedValueOnce(error);
-
-      const result = await deleteRagFile({ userId: 'user123', file });
-
-      expect(result).toBe(false);
-      expect(mockedLogger.error).toHaveBeenCalledWith(
-        '[deleteRagFile] Document file-agent is an agent file and the delete named no agent; its embeddings remain in the RAG API',
-      );
-      expect(mockedLogger.warn).not.toHaveBeenCalled();
-    });
-
     it('should treat 404 as already gone when the agent was named', async () => {
       const file = { file_id: 'file-agent', embedded: true, context: 'agents' };
       const error = new Error('Not Found') as Error & { response?: { status?: number } };
@@ -116,6 +101,9 @@ describe('deleteRagFile', () => {
       const result = await deleteRagFile({ userId: 'user123', file, entityId: 'agent_abc' });
 
       expect(result).toBe(true);
+      expect(mockedLogger.warn).toHaveBeenCalledWith(
+        '[deleteRagFile] Document file-agent not found in RAG API, may have been deleted already',
+      );
       expect(mockedLogger.error).not.toHaveBeenCalled();
     });
 

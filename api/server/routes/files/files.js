@@ -18,6 +18,7 @@ const {
   assertUploadContentAllowed,
   hasActiveFilePolicy,
   sanitizeFilename,
+  deleteRagFile,
 } = require('@librechat/api');
 const {
   Time,
@@ -249,6 +250,30 @@ router.delete('/', async (req, res) => {
         agent_id: req.body.agent_id,
         files: agentFiles,
       });
+
+      /** A `file_search` upload embeds under the agent's id, not the uploader's, so the
+       * embeddings belong to this attachment rather than to the file. Unlinking is the only
+       * request that knows the agent, and the record stays with its owner, so the embeddings
+       * are removed here rather than when the file itself is deleted. */
+      if (req.body.tool_resource === EToolResources.file_search) {
+        const unlinkedIds = new Set(agentFiles.map((file) => file.file_id));
+        const embeddedFiles = dbFiles.filter(
+          (file) => file.embedded === true && unlinkedIds.has(file.file_id),
+        );
+        const results = await Promise.all(
+          embeddedFiles.map((file) =>
+            deleteRagFile({ userId: req.user.id, file, entityId: req.body.agent_id }),
+          ),
+        );
+        const remaining = embeddedFiles.filter((_, index) => results[index] !== true);
+        if (remaining.length > 0) {
+          logger.error(
+            `[/files] Embeddings under agent ${req.body.agent_id} were not removed for unlinked file(s): ${remaining
+              .map((file) => file.file_id)
+              .join(', ')}`,
+          );
+        }
+      }
       res.status(200).json({ message: 'File associations removed successfully from agent' });
       return;
     }
