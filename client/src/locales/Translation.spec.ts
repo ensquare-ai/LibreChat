@@ -1,12 +1,16 @@
 import type { TranslationResource } from './i18n';
 import {
+  __offerAllLocalesForTests,
   __resetLocaleForTests,
   __setLocaleLoaderForTests,
   changeLanguageSafely,
   ensureLocale,
   initializeI18n,
+  isOfferedLocale,
   normalizeLocale,
+  offeredLocales,
 } from './i18n';
+import Albanian from './sq/translation.json';
 import English from './en/translation.json';
 import Spanish from './es/translation.json';
 import French from './fr/translation.json';
@@ -25,9 +29,16 @@ function deferred<T>() {
 }
 
 describe('i18next translation tests', () => {
+  let restoreOfferedLocales: () => void;
+
   // Ensure i18next is initialized before any tests run
   beforeAll(async () => {
+    restoreOfferedLocales = __offerAllLocalesForTests();
     await initializeI18n();
+  });
+
+  afterAll(() => {
+    restoreOfferedLocales();
   });
 
   afterEach(async () => {
@@ -201,5 +212,34 @@ describe('i18next translation tests', () => {
     restoreSl();
     __resetLocaleForTests('sv');
     __resetLocaleForTests('sl');
+  });
+});
+
+describe('the locales this deployment offers', () => {
+  const namingUpstream = (translation: Record<string, string>) =>
+    Object.entries(translation)
+      .filter(([, text]) => /libre\s*chat/i.test(text))
+      .map(([key]) => key);
+
+  it('offers English and Albanian only', () => {
+    expect(offeredLocales).toEqual(['en', 'sq']);
+  });
+
+  it('answers a request for any other language in English', () => {
+    expect(normalizeLocale('de-DE')).toBe('en');
+    expect(normalizeLocale('fr')).toBe('en');
+    expect(normalizeLocale('en-US')).toBe('en');
+    expect(normalizeLocale('sq-AL')).toBe('sq');
+  });
+
+  it('keeps only the offered languages in the selector', () => {
+    expect(isOfferedLocale('en-US')).toBe(true);
+    expect(isOfferedLocale('sq')).toBe(true);
+    expect(isOfferedLocale('zh-Hans')).toBe(false);
+  });
+
+  it('never names the upstream product in an offered translation', () => {
+    expect(namingUpstream(English)).toEqual([]);
+    expect(namingUpstream(Albanian)).toEqual([]);
   });
 });
