@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { logger } from '@librechat/data-schemas';
+import { FileContext } from 'librechat-data-provider';
 import { generateShortLivedToken } from '~/crypto/jwt';
 
 interface DeleteRagFileParams {
@@ -9,8 +10,18 @@ interface DeleteRagFileParams {
   file: {
     file_id: string;
     embedded?: boolean;
+    context?: string;
   };
+  /**
+   * The agent the file was embedded under, when it was uploaded as an agent tool resource.
+   * The RAG API files such embeddings under the agent's id rather than the uploader's, and
+   * only finds them again when the delete names the same id.
+   */
+  entityId?: string | null;
 }
+
+const isAgentFile = (file: DeleteRagFileParams['file']): boolean =>
+  file.context === FileContext.agents;
 
 /**
  * Deletes embedded document(s) from the RAG API.
@@ -20,9 +31,14 @@ interface DeleteRagFileParams {
  * @param params - The parameters object.
  * @param params.userId - The user ID for authentication.
  * @param params.file - The file object. Must have `embedded` and `file_id` properties.
+ * @param params.entityId - The agent id the file was embedded under, if any.
  * @returns Returns true if deletion was successful or skipped, false if there was an error.
  */
-export async function deleteRagFile({ userId, file }: DeleteRagFileParams): Promise<boolean> {
+export async function deleteRagFile({
+  userId,
+  file,
+  entityId,
+}: DeleteRagFileParams): Promise<boolean> {
   if (!file.embedded || !process.env.RAG_API_URL) {
     return true;
   }
@@ -41,20 +57,26 @@ export async function deleteRagFile({ userId, file }: DeleteRagFileParams): Prom
         'Content-Type': 'application/json',
         accept: 'application/json',
       },
+      ...(entityId ? { params: { entity_id: entityId } } : {}),
       data: [file.file_id],
     });
     logger.debug(`[deleteRagFile] Successfully deleted document ${file.file_id} from RAG API`);
     return true;
   } catch (error) {
     const axiosError = error as { response?: { status?: number }; message?: string };
-    if (axiosError.response?.status === 404) {
-      logger.warn(
-        `[deleteRagFile] Document ${file.file_id} not found in RAG API, may have been deleted already`,
-      );
-      return true;
-    } else {
+    if (axiosError.response?.status !== 404) {
       logger.error('[deleteRagFile] Error deleting document from RAG API:', axiosError.message);
       return false;
     }
+    if (isAgentFile(file) && !entityId) {
+      logger.error(
+        `[deleteRagFile] Document ${file.file_id} is an agent file and the delete named no agent; its embeddings remain in the RAG API`,
+      );
+      return false;
+    }
+    logger.warn(
+      `[deleteRagFile] Document ${file.file_id} not found in RAG API, may have been deleted already`,
+    );
+    return true;
   }
 }

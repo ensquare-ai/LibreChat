@@ -64,6 +64,61 @@ describe('deleteRagFile', () => {
       );
     });
 
+    it('should name the agent the file was embedded under when one is given', async () => {
+      const file = { file_id: 'file-123', embedded: true, context: 'agents' };
+      mockedAxios.delete.mockResolvedValueOnce({ status: 200 });
+
+      const result = await deleteRagFile({ userId: 'user123', file, entityId: 'agent_abc' });
+
+      expect(result).toBe(true);
+      expect(mockedAxios.delete).toHaveBeenCalledWith('http://localhost:8000/documents', {
+        headers: {
+          Authorization: 'Bearer mock-jwt-token',
+          'Content-Type': 'application/json',
+          accept: 'application/json',
+        },
+        params: { entity_id: 'agent_abc' },
+        data: ['file-123'],
+      });
+    });
+
+    it('should not send an entity when none is given', async () => {
+      const file = { file_id: 'file-123', embedded: true };
+      mockedAxios.delete.mockResolvedValueOnce({ status: 200 });
+
+      await deleteRagFile({ userId: 'user123', file, entityId: null });
+
+      const [, config] = mockedAxios.delete.mock.calls[0];
+      expect(config).not.toHaveProperty('params');
+    });
+
+    it('should report orphaned embeddings when an agent file is deleted without naming its agent', async () => {
+      const file = { file_id: 'file-agent', embedded: true, context: 'agents' };
+      const error = new Error('Not Found') as Error & { response?: { status?: number } };
+      error.response = { status: 404 };
+      mockedAxios.delete.mockRejectedValueOnce(error);
+
+      const result = await deleteRagFile({ userId: 'user123', file });
+
+      expect(result).toBe(false);
+      expect(mockedLogger.error).toHaveBeenCalledWith(
+        '[deleteRagFile] Document file-agent is an agent file and the delete named no agent; its embeddings remain in the RAG API',
+      );
+      expect(mockedLogger.warn).not.toHaveBeenCalled();
+    });
+
+    it('should treat 404 as already gone when the agent was named', async () => {
+      const file = { file_id: 'file-agent', embedded: true, context: 'agents' };
+      const error = new Error('Not Found') as Error & { response?: { status?: number } };
+      error.response = { status: 404 };
+      mockedAxios.delete.mockRejectedValueOnce(error);
+
+      const result = await deleteRagFile({ userId: 'user123', file, entityId: 'agent_abc' });
+
+      expect(result).toBe(true);
+      expect(mockedLogger.error).not.toHaveBeenCalled();
+    });
+
     it('should return true and log warning when document is not found (404)', async () => {
       const file = { file_id: 'file-not-found', embedded: true };
       const error = new Error('Not Found') as Error & { response?: { status?: number } };
