@@ -68,6 +68,18 @@ describe('i18next translation tests', () => {
     expect(i18n.t('com_endpoint_default_with_num', { 0: 'Marie' })).toBe('par défaut : Marie');
   });
 
+  it('should register, load and fall back to English for Albanian', async () => {
+    __resetLocaleForTests('sq');
+    const untranslatedKey = 'com_ui_examples';
+
+    expect(normalizeLocale('sq-AL')).toBe('sq');
+    await expect(changeLanguageSafely('sq')).resolves.toBe('sq');
+    expect(i18n.language).toBe('sq');
+    expect(i18n.hasResourceBundle('sq', 'translation')).toBe(true);
+    expect(i18n.getResource('sq', 'translation', untranslatedKey)).toBeUndefined();
+    expect(i18n.t(untranslatedKey)).toBe(English[untranslatedKey]);
+  });
+
   it('should normalize language selector values to locale files', () => {
     expect(normalizeLocale('en-US')).toBe('en');
     expect(normalizeLocale('de-DE')).toBe('de');
