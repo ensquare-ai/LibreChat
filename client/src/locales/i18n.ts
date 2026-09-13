@@ -57,6 +57,15 @@ export const resources = {
   en: { translation: translationEn },
 } as const;
 
+/**
+ * The locales this deployment offers. The fork carries every upstream locale, and the others
+ * name the upstream product in their strings, so a browser, cookie or stored preference asking
+ * for one of them is answered in English instead.
+ */
+export const offeredLocales: readonly SupportedLocale[] = ['en', 'sq'];
+
+let offered = new Set<SupportedLocale>(offeredLocales);
+
 const localeLoaders: Record<
   Exclude<SupportedLocale, 'en'>,
   () => Promise<{ default: TranslationResource }>
@@ -196,7 +205,7 @@ function getNavigatorLanguage() {
   return navigator.language || navigator.languages?.[0] || 'en';
 }
 
-export function normalizeLocale(locale?: string | null): SupportedLocale {
+function resolveLocale(locale?: string | null): SupportedLocale {
   const requested = locale === 'auto' ? getNavigatorLanguage() : locale;
   if (!requested) {
     return 'en';
@@ -215,6 +224,15 @@ export function normalizeLocale(locale?: string | null): SupportedLocale {
 
   const base = normalized.split('-')[0];
   return localeByLowercase[base] ?? localeAliases[base] ?? 'en';
+}
+
+export function normalizeLocale(locale?: string | null): SupportedLocale {
+  const resolved = resolveLocale(locale);
+  return offered.has(resolved) ? resolved : 'en';
+}
+
+export function isOfferedLocale(locale: string): boolean {
+  return offered.has(resolveLocale(locale));
 }
 
 export function detectInitialLanguage() {
@@ -267,6 +285,14 @@ export function __setLocaleLoaderForTests(
   localeLoaders[locale] = loader;
   return () => {
     localeLoaders[locale] = previousLoader;
+  };
+}
+
+export function __offerAllLocalesForTests() {
+  const previous = offered;
+  offered = new Set<SupportedLocale>(supportedLocales);
+  return () => {
+    offered = previous;
   };
 }
 
