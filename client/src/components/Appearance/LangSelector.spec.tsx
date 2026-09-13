@@ -39,7 +39,7 @@ describe('LangSelector', () => {
       unobserve = jest.fn();
       disconnect = jest.fn();
     };
-    const { getByRole, getByTestId } = render(
+    const { getByRole, getByTestId, queryByRole } = render(
       <RecoilRoot>
         <LangSelector langcode="en-US" onChange={mockOnChange} />
       </RecoilRoot>,
@@ -51,11 +51,13 @@ describe('LangSelector', () => {
 
     await clickDropdown(dropdownButton);
 
-    const italianOption = getByRole('option', { name: 'Italiano' });
-    await clickDropdown(italianOption);
+    expect(queryByRole('option', { name: 'Italiano' })).not.toBeInTheDocument();
+
+    const albanianOption = getByRole('option', { name: 'Shqip' });
+    await clickDropdown(albanianOption);
 
     await waitFor(() => {
-      expect(mockOnChange).toHaveBeenCalledWith('it-IT');
+      expect(mockOnChange).toHaveBeenCalledWith('sq');
     });
   });
 
