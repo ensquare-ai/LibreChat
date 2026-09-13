@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const mime = require('mime');
 const { v4 } = require('uuid');
 const {
@@ -666,6 +667,61 @@ const processFileUpload = async ({ req, res, metadata, sseStream }) => {
   sendUploadSuccess(res, sseStream, 'File uploaded and processed successfully', result);
 };
 
+/** The identity a duplicate check compares on: a sha256 of the bytes as uploaded, the
+ * same notion of identity a corpus manifest pins documents by. Filenames are not
+ * compared — a renamed re-upload is still a duplicate.
+ * @param {string} filePath
+ * @returns {Promise<string | null>} `null` when the file could not be read; the upload
+ * that follows will fail on its own terms, and a hashing failure must not block it. */
+async function hashFileContent(filePath) {
+  try {
+    const hash = crypto.createHash('sha256');
+    for await (const chunk of fs.createReadStream(filePath)) {
+      hash.update(chunk);
+    }
+    return hash.digest('hex');
+  } catch (error) {
+    logger.warn(`[hashFileContent] Could not hash ${filePath}: ${error.message}`);
+    return null;
+  }
+}
+
+/** A file already attached to the agent's `file_search` with the same content hash.
+ * @param {object} params
+ * @param {string} params.agent_id
+ * @param {string} params.contentHash
+ * @returns {Promise<{ file_id: string, filename: string } | null>} */
+async function findAttachedDuplicate({ agent_id, contentHash }) {
+  const agent = await db.getAgent({ id: agent_id });
+  const attachedIds = agent?.tool_resources?.[EToolResources.file_search]?.file_ids ?? [];
+  if (attachedIds.length === 0) {
+    return null;
+  }
+  const matches = await db.getFiles(
+    { file_id: { $in: attachedIds }, 'metadata.contentHash': contentHash },
+    null,
+    { file_id: 1, filename: 1 },
+  );
+  const match = matches?.[0];
+  return match ? { file_id: match.file_id, filename: match.filename } : null;
+}
+
+/** Refuses the upload rather than embedding a second copy. The route answers it with
+ * 409 (`userErrorStatusCode`) and names the attached file, so the curator can remove
+ * that one first if the intent was to replace it.
+ * @param {object} params
+ * @param {Express.Multer.File} params.file
+ * @param {{ file_id: string, filename: string }} params.duplicate */
+function createDuplicateAgentFileError({ file, duplicate }) {
+  const error = new Error(
+    `"${file.originalname}" has the same content as "${duplicate.filename}" (${duplicate.file_id}), which is already attached to this agent`,
+  );
+  error.code = 'duplicate_agent_file';
+  error.userErrorStatusCode = 409;
+  error.duplicateOf = duplicate;
+  return error;
+}
+
 /**
  * Applies the current strategy for file uploads.
  * Saves file metadata to the database with an expiry TTL.
@@ -979,6 +1035,18 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
   const source = getFileStrategy(appConfig, { isImage: isImageFile });
 
   if (tool_resource === EToolResources.file_search) {
+    /** Before anything is stored or embedded: the same bytes attached to this agent
+     * twice would embed twice, and retrieval would then return one passage as two
+     * sources. Compared on content, scoped to this agent — the same document may sit
+     * in two agents. A record that predates the hash is not compared. */
+    const contentHash = await hashFileContent(file.path);
+    if (contentHash != null) {
+      const duplicate = await findAttachedDuplicate({ agent_id, contentHash });
+      if (duplicate != null) {
+        throw createDuplicateAgentFileError({ file, duplicate });
+      }
+    }
+
     // FIRST: Upload to Storage for permanent backup (S3/local/etc.)
     const { handleFileUpload } = getStrategyFunctions(source);
     const sanitizedUploadFn = createSanitizedUploadWrapper(handleFileUpload);
@@ -1000,8 +1068,9 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
       entity_id,
     });
 
-    // Vector status will be stored at root level, no need for metadata
-    fileInfoMetadata = {};
+    // Vector status is stored at root level; the content hash is what the next upload
+    // of the same bytes is compared against.
+    fileInfoMetadata = contentHash != null ? { contentHash } : {};
   } else {
     // Standard single storage for non-RAG files
     const { handleFileUpload } = getStrategyFunctions(source);

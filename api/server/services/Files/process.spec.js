@@ -177,6 +177,8 @@ jest.mock('~/models', () => ({
   addAgentResourceFile: jest.fn().mockResolvedValue({}),
   removeAgentResourceFiles: jest.fn(),
   removeAgentResourceFilesFromAllAgents: jest.fn(),
+  getAgent: jest.fn().mockResolvedValue(null),
+  getFiles: jest.fn().mockResolvedValue([]),
 }));
 
 jest.mock('~/server/utils/getFileStrategy', () => ({
@@ -493,6 +495,107 @@ describe('processAgentFileUpload', () => {
       expect(inspectContent).not.toHaveBeenCalled();
       expect(db.addAgentResourceFile).toHaveBeenCalledTimes(1);
       expect(db.createFile).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('duplicate content attached to the same agent', () => {
+    const os = require('os');
+    const realFs = jest.requireActual('fs');
+    const crypto = require('crypto');
+    let uploadPath;
+    const bytes = Buffer.from('Neni 1. Kodi i Punës rregullon marrëdhëniet e punës.\n');
+    const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+
+    const makeUploadReq = () => {
+      const req = makeReq({ mimetype: 'text/plain' });
+      req.file = { ...req.file, path: uploadPath, originalname: 'labour-code.txt' };
+      return req;
+    };
+    const fileSearchMetadata = () => ({
+      ...makeMetadata(),
+      tool_resource: EToolResources.file_search,
+    });
+
+    beforeEach(() => {
+      uploadPath = realFs.mkdtempSync(`${os.tmpdir()}/lc-dedup-`) + '/upload.txt';
+      realFs.writeFileSync(uploadPath, bytes);
+      setupStoredFileUpload();
+      db.getAgent.mockResolvedValue({
+        id: 'agent-abc',
+        tool_resources: { file_search: { file_ids: ['file-existing'] } },
+      });
+      db.getFiles.mockResolvedValue([]);
+    });
+
+    afterEach(() => {
+      realFs.rmSync(uploadPath, { force: true });
+    });
+
+    it('refuses the upload before storing or embedding when the same bytes are already attached', async () => {
+      db.getFiles.mockResolvedValue([{ file_id: 'file-existing', filename: 'kodi-i-punes.txt' }]);
+
+      await expect(
+        processAgentFileUpload({
+          req: makeUploadReq(),
+          res: mockRes,
+          metadata: fileSearchMetadata(),
+        }),
+      ).rejects.toMatchObject({
+        code: 'duplicate_agent_file',
+        userErrorStatusCode: 409,
+        duplicateOf: { file_id: 'file-existing', filename: 'kodi-i-punes.txt' },
+      });
+
+      /** Matched on content, scoped to this agent's attached files, by the stored hash. */
+      expect(db.getFiles).toHaveBeenCalledWith(
+        { file_id: { $in: ['file-existing'] }, 'metadata.contentHash': sha256 },
+        null,
+        { file_id: 1, filename: 1 },
+      );
+      expect(uploadVectors).not.toHaveBeenCalled();
+      expect(db.createFile).not.toHaveBeenCalled();
+      expect(db.addAgentResourceFile).not.toHaveBeenCalled();
+    });
+
+    it('records the content hash on the file so the next upload of the same bytes is caught', async () => {
+      await processAgentFileUpload({
+        req: makeUploadReq(),
+        res: mockRes,
+        metadata: fileSearchMetadata(),
+      });
+
+      expect(uploadVectors).toHaveBeenCalled();
+      expect(db.createFile).toHaveBeenCalledWith(
+        expect.objectContaining({ metadata: { contentHash: sha256 } }),
+        true,
+      );
+    });
+
+    it('does not compare against files attached to other agents', async () => {
+      db.getAgent.mockResolvedValue({
+        id: 'agent-abc',
+        tool_resources: { file_search: { file_ids: [] } },
+      });
+
+      await processAgentFileUpload({
+        req: makeUploadReq(),
+        res: mockRes,
+        metadata: fileSearchMetadata(),
+      });
+
+      expect(db.getFiles).not.toHaveBeenCalled();
+      expect(uploadVectors).toHaveBeenCalled();
+    });
+
+    it('lets the upload proceed, unhashed, when the file cannot be read', async () => {
+      const req = makeUploadReq();
+      req.file.path = `${uploadPath}.missing`;
+
+      await processAgentFileUpload({ req, res: mockRes, metadata: fileSearchMetadata() });
+
+      expect(db.getAgent).not.toHaveBeenCalled();
+      expect(uploadVectors).toHaveBeenCalled();
+      expect(db.createFile).toHaveBeenCalledWith(expect.objectContaining({ metadata: {} }), true);
     });
   });
 

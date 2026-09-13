@@ -130,6 +130,7 @@
   "com_error_context_tokens_detail": "Mesazhet tuaja kërkojnë {{0}} tokena, por janë në dispozicion vetëm {{1}}.",
   "com_error_empty_messages": "Mesazhet tuaja nuk nxënë në dritaren aktuale të kontekstit, prandaj nuk mbeti asgjë për t'i dërguar modelit. Rritni madhësinë maksimale të kontekstit te parametrat e bisedës, shkurtoni mesazhin ose filloni një bisedë të re.",
   "com_error_files_dupe": "U zbulua një skedar i dyfishtë.",
+  "com_error_files_duplicate_in_agent": "Ky dokument ndodhet tashmë në këtë bazë njohurish: një skedar i bashkangjitur ka përmbajtje identike. Hiqeni fillimisht atë kopje nëse doni ta zëvendësoni.",
   "com_error_files_empty": "Skedarët bosh nuk lejohen.",
   "com_error_files_process": "Ndodhi një gabim gjatë përpunimit të skedarit.",
   "com_error_files_skipped_dupe": "U anashkaluan skedarët e dyfishtë: {{0}}",

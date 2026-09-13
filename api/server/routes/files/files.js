@@ -820,12 +820,19 @@ const handleFileUpload = async (req, res) => {
     const contentProtectionActive =
       hasActiveFilePolicy(req.config?.filters) ||
       hasActivePiiPatterns(req.config?.messageFilter?.pii);
-    const message = resolveUploadErrorMessage(
-      error,
-      'Error processing file',
-      contentProtectionActive,
-    );
-    logger.error('[/files] Error processing file:', getSafeErrorMetadata(error));
+    /** A refused duplicate is the curator's decision to make, not a failure: the message is
+     * a translation key the client renders in its own language, and `duplicateOf` names
+     * the attached file so it can be removed first if the intent was to replace it. */
+    const isDuplicate = error?.code === 'duplicate_agent_file';
+    const message = isDuplicate
+      ? 'com_error_files_duplicate_in_agent'
+      : resolveUploadErrorMessage(error, 'Error processing file', contentProtectionActive);
+    const duplicateOf = isDuplicate ? error.duplicateOf : undefined;
+    if (isDuplicate) {
+      logger.warn(`[/files] Upload refused as a duplicate: ${error.message}`);
+    } else {
+      logger.error('[/files] Error processing file:', getSafeErrorMetadata(error));
+    }
 
     try {
       await fs.unlink(req.file.path);
@@ -849,9 +856,10 @@ const handleFileUpload = async (req, res) => {
         temp_file_id: metadata.temp_file_id,
         tool_resource: metadata.tool_resource,
         display_to_user: true,
+        ...(duplicateOf ? { duplicate_of: duplicateOf } : {}),
       });
     } else {
-      res.status(errorStatusCode).json({ message });
+      res.status(errorStatusCode).json({ message, ...(duplicateOf ? { duplicateOf } : {}) });
     }
   } finally {
     if (cleanup) {

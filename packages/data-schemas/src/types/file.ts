@@ -73,6 +73,8 @@ export interface IMongoFile extends Omit<Document, 'model'> {
     codeEnvRefs?: CodeEnvRefMap;
     /** Dispatch-order stamp for the current source artifact generation. */
     sourceDispatchedAt?: number;
+    /** sha256 of the uploaded bytes, set for agent `file_search` uploads. */
+    contentHash?: string;
   };
   expiresAt?: Date;
   expiredAt?: Date | null;

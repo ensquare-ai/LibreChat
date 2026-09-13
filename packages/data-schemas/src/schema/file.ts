@@ -135,6 +135,12 @@ const file: Schema<IMongoFile> = new Schema(
         type: Number,
         default: undefined,
       },
+      /** sha256 of the bytes as uploaded, set for agent `file_search` uploads so a second
+       *  upload of the same content to the same agent is refused before it embeds. */
+      contentHash: {
+        type: String,
+        default: undefined,
+      },
     },
     expiresAt: {
       /* Short-lived upload TTL managed by MongoDB. This is separate from
