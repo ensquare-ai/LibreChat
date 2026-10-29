@@ -49,6 +49,14 @@ describe('themeSchema', () => {
     expect(themeSchema.safeParse({ ...validTheme, colours: {} }).success).toBe(false);
   });
 
+  it('accepts a theme confined to the sign-in screens', () => {
+    expect(themeSchema.safeParse({ ...validTheme, scope: 'login' }).success).toBe(true);
+  });
+
+  it('rejects a scope it cannot honour, because a typo would theme the wrong screens', () => {
+    expect(themeSchema.safeParse({ ...validTheme, scope: 'signin' }).success).toBe(false);
+  });
+
   it('does not judge the tokens inside a mode', () => {
     /** A token the design system does not know is a *client* error, surfaced by the
      *  validator with the default left standing. Rejecting it here would stop a
