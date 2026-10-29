@@ -1817,11 +1817,23 @@ export const themeModeDefinitionSchema = z
   })
   .passthrough();
 
+/**
+ * Where a theme renders. `everywhere` is what a theme meant before the field existed;
+ * `login` confines it to the sign-in, registration, password and verification screens,
+ * with the bundled default rendering once a user is in. The client's loader reads the
+ * field and takes it off before the design system's validator sees the definition,
+ * since that validator rejects any field it does not know.
+ */
+export const themeScopes = ['everywhere', 'login'] as const;
+
+export type ThemeScope = (typeof themeScopes)[number];
+
 export const themeSchema = z
   .object({
     /** Only version 1 exists. A future version is a client that knows about it. */
     version: z.literal(1),
     name: z.string().min(1),
+    scope: z.enum(themeScopes).optional(),
     modes: z
       .object({
         light: themeModeDefinitionSchema.optional(),

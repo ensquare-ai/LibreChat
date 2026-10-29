@@ -51,8 +51,9 @@ const App = () => {
           {/* Reads the deployment's theme from the startup config, validates it with
               upstream's validator, and leaves the bundled default rendering if it
               does not pass. The environment path is unchanged and still applies
-              when nothing is configured. */}
-          <ConfiguredThemeProvider>
+              when nothing is configured. The router is how the loader knows whether
+              the visitor is on a sign-in screen, for a theme confined to those. */}
+          <ConfiguredThemeProvider router={router}>
             <RadixToast.Provider>
               <ToastProvider>
                 <DndProvider backend={HTML5Backend}>
