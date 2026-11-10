@@ -1,6 +1,8 @@
 import React from 'react';
 import { RecoilRoot } from 'recoil';
 import { fireEvent, render, screen } from '@testing-library/react';
+import '~/Providers/MessagePartsHostContext';
+import { FailedRevealContext } from '@librechat/chat/components';
 import AskUserQuestionCall from '../AskUserQuestionCall';
 import store from '~/store';
 
@@ -23,11 +25,10 @@ jest.mock('~/hooks', () => ({
       ? template
       : template.replace(/\{\{(\w+)\}\}/g, (_match, name: string) => values[name] ?? '');
   },
-  /** The disclosure is the behaviour under test — keep the real hook. */
-  useExpandCollapse: jest.requireActual('~/hooks/Messages/useExpandCollapse').default,
 }));
 
-jest.mock('~/utils/approval', () => ({
+jest.mock('@librechat/chat', () => ({
+  ...jest.requireActual('@librechat/chat'),
   getSubmittedAskAnswer: () => undefined,
   parseAskUserQuestionArgs: (args: string | Record<string, unknown> | undefined) => {
     if (typeof args === 'string') {
@@ -49,14 +50,13 @@ jest.mock('../AskUserQuestionProgress', () => ({
   },
 }));
 
-jest.mock('../Container', () => ({
-  __esModule: true,
-  default: ({ children }: { children: React.ReactNode }) => {
+jest.mock('@librechat/chat/components', () => ({
+  ...jest.requireActual('@librechat/chat/components'),
+  Container: ({ children }: { children: React.ReactNode }) => {
     const { createElement } = jest.requireActual<typeof React>('react');
     return createElement('div', null, children);
   },
 }));
-
 /** Settled records mount collapsed, exactly like every other tool card. */
 const renderCall = (ui: React.ReactElement, autoExpand = false) =>
   render(
@@ -108,6 +108,29 @@ describe('AskUserQuestionCall', () => {
     fireEvent.click(header);
 
     expect(header).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  test.each([
+    { failed: true, runStepStatus: 'completed' as const },
+    { failed: false, runStepStatus: 'failed' as const },
+  ])('reveals a terminal question failure from its parent fold (%p)', (failure) => {
+    const call = <AskUserQuestionCall args={args} output="" {...failure} />;
+    const tree = (tick: number) => (
+      <RecoilRoot>
+        <FailedRevealContext.Provider value={{ tick, claimFocus: () => true }}>
+          {call}
+        </FailedRevealContext.Provider>
+      </RecoilRoot>
+    );
+    const { rerender } = render(tree(0));
+    const button = screen.getByRole('button', { name: /Question wasn't shown/ });
+    expect(button).toHaveAttribute('aria-expanded', 'false');
+
+    rerender(tree(1));
+
+    expect(button).toHaveAttribute('aria-expanded', 'true');
+    expect(button).toHaveFocus();
+    expect(button).toHaveTextContent('failed');
   });
 
   test('opens at mount when auto-expand is on', () => {

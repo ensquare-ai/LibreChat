@@ -1,10 +1,20 @@
+import { megabyte } from 'librechat-data-provider';
 import type { FiltersConfig } from 'librechat-data-provider';
 import {
   getBlockedUninspectableFileField,
   hasActiveFilePolicy,
   UninspectableFileError,
 } from '~/protection/files';
+import { SpreadsheetLimitError } from './documents/workbook';
+import { SpreadsheetBusyError } from './upload/errors';
 import { getSafeErrorMetadata } from '~/utils/errors';
+
+/**
+ * The most extracted text a file document can hold. MongoDB refuses a document past 16 MiB and
+ * the text shares it with the file's other fields, so this bounds storage rather than policy:
+ * what reaches a model is governed by `fileContextCharLimit` and `fileTokenLimit`.
+ */
+export const MAX_STORED_EXTRACTED_TEXT_BYTES: number = 15 * megabyte;
 
 interface ExtractedFileText {
   readonly text?: string | null;
@@ -64,7 +74,12 @@ export async function extractInspectableFileText<T extends ExtractedFileText>(in
     }
     return result;
   } catch (error) {
-    if (blockedField == null || error instanceof UninspectableFileError) {
+    if (
+      blockedField == null ||
+      error instanceof UninspectableFileError ||
+      error instanceof SpreadsheetBusyError ||
+      error instanceof SpreadsheetLimitError
+    ) {
       throw error;
     }
     throw new UninspectableFileError(blockedField);

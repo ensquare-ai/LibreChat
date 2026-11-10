@@ -23,8 +23,9 @@ import ts from 'typescript';
  * that talks to MongoDB — this package, `packages/api`, and `api` — because the
  * regression class is repo-wide and new backend code lands in `packages/api`.
  * Dataflow is followed within a file only — a pipeline imported from another
- * module is out of reach — and the method sweep and the live cluster run are
- * the completeness backstops, not this guard.
+ * module is out of reach — and a dotted `$where` is judged only where syntax is
+ * unambiguous (see `isUnjudgedDottedWhere`); the method sweep and the live
+ * cluster run are the completeness backstops, not this guard.
  * If a construct here becomes genuinely necessary, the fix is a compatible
  * rewrite, not an exception list: `misc/documentdb/audit.documentdb.spec.ts`
  * re-adjudicates any of this against a real cluster.
@@ -186,11 +187,13 @@ function parse(fileName: string, source: string): ts.SourceFile {
   return ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
 }
 
-/** Peels casts and parentheses so `[...] as PipelineStage[]` is still an array. */
+/** Peels casts, assertions and parentheses so `[...] as PipelineStage[]` and
+ * `<PipelineStage[]>[...]` are still arrays. */
 function unwrapExpression(expression: ts.Expression): ts.Expression {
   let current = expression;
   while (
     ts.isAsExpression(current) ||
+    ts.isTypeAssertionExpression(current) ||
     ts.isSatisfiesExpression(current) ||
     ts.isParenthesizedExpression(current) ||
     ts.isNonNullExpression(current)
@@ -400,10 +403,134 @@ function findPipelineUpdates(sourceFile: ts.SourceFile): string[] {
   return offenses;
 }
 
+/** Reports `$lookup` stages using the correlated `let`/`pipeline` form, which
+ * Amazon DocumentDB 5.0 rejects. The marketplace author pipeline is checked
+ * separately because tenant/probe.ts deliberately exercises that unsupported
+ * form to verify its compatibility probe. */
+function findCorrelatedLookups(sourceFile: ts.SourceFile): string[] {
+  const objects = collectObjectValuedNames(sourceFile);
+  const offenses: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isPropertyAssignment(node) && propertyName(node) === '$lookup') {
+      const initializer = unwrapExpression(node.initializer);
+      const lookup = ts.isIdentifier(initializer) ? objects.get(initializer.text) : initializer;
+      if (lookup != null && ts.isObjectLiteralExpression(lookup)) {
+        for (const property of lookup.properties) {
+          const name = propertyName(property);
+          if (name === 'let' || name === 'pipeline') {
+            offenses.push(offenseAt(sourceFile, property, `$lookup.${name}`));
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return offenses;
+}
+
 /** Reports forbidden operator tokens in string literals and property names,
  * ignoring prose — the rewrites explain themselves by naming the construct —
  * and type members, which never reach the engine (Mongoose documents declare
  * a `$where` field). */
+/** The operator's value is code; the document bag's value is field predicates. */
+function isJavaScriptSource(expression: ts.Expression): boolean {
+  const unwrapped = unwrapExpression(expression);
+  return (
+    ts.isStringLiteralLike(unwrapped) ||
+    ts.isTemplateExpression(unwrapped) ||
+    ts.isArrowFunction(unwrapped) ||
+    ts.isFunctionExpression(unwrapped)
+  );
+}
+
+/**
+ * A dotted `$where` is Mongoose's per-document save-condition bag on a document
+ * (`mongoose/lib/model.js` copies its keys into the save filter as ordinary field
+ * predicates, so nothing named `$where` reaches the server) and the JavaScript
+ * evaluation operator on a query or filter, and syntax alone cannot tell the two
+ * apart. So it is judged only where the syntax is unambiguous: a CALL
+ * (`query.$where(js)`, parenthesised, or through `call`/`apply`/`bind`) or an
+ * assignment of CODE (a string, template, arrow or function). A read, or an
+ * assignment of anything else — `document.$where = { … }` in
+ * `tenantIsolation.ts`, but equally `filter.$where = predicate` — is not claimed
+ * either way; for the latter the method sweep and the live cluster run are the
+ * backstop. Every other way of writing the operator (`{ $where: … }`,
+ * `'$where'`, `obj['$where']`) remains an offense.
+ */
+const CALL_FORWARDERS = new Set(['call', 'apply', 'bind']);
+const CODE_ASSIGNMENT_OPERATORS = new Set([
+  ts.SyntaxKind.EqualsToken,
+  ts.SyntaxKind.PlusEqualsToken,
+  ts.SyntaxKind.QuestionQuestionEqualsToken,
+  ts.SyntaxKind.BarBarEqualsToken,
+  ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+]);
+
+/** Steps outward through the wrappers `unwrapExpression` peels inward, so a
+ * call on or an assignment to `(x)`, `x as T`, `<T>x`, `x satisfies T` or `x!`
+ * is still one on `x`. */
+function outermostWrapper(node: ts.Node): ts.Node {
+  let current = node;
+  while (
+    ts.isParenthesizedExpression(current.parent) ||
+    ts.isAsExpression(current.parent) ||
+    ts.isTypeAssertionExpression(current.parent) ||
+    ts.isSatisfiesExpression(current.parent) ||
+    ts.isNonNullExpression(current.parent)
+  ) {
+    current = current.parent;
+  }
+  return current;
+}
+
+function isInvoked(callee: ts.Node): boolean {
+  const use = outermostWrapper(callee).parent;
+  return ts.isCallExpression(use) && use.expression === outermostWrapper(callee);
+}
+
+/** The member name a node is accessed through, whether dotted (`x.call`) or by a
+ * string element (`x['call']`). */
+function memberName(use: ts.Node, receiver: ts.Node): string | undefined {
+  if (ts.isPropertyAccessExpression(use) && use.expression === receiver) {
+    return use.name.text;
+  }
+  if (ts.isElementAccessExpression(use) && use.expression === receiver) {
+    const argument = unwrapExpression(use.argumentExpression);
+    return ts.isStringLiteralLike(argument) ? argument.text : undefined;
+  }
+  return undefined;
+}
+
+/** A direct call, or a call through `call`/`apply`/`bind` — the forwarder itself
+ * must be invoked, so a bag field that merely shares one of those names is not a call. */
+function isCalled(access: ts.PropertyAccessExpression): boolean {
+  if (isInvoked(access)) {
+    return true;
+  }
+  const target = outermostWrapper(access);
+  const forwarder = memberName(target.parent, target);
+  return forwarder != null && CALL_FORWARDERS.has(forwarder) && isInvoked(target.parent);
+}
+
+function isUnjudgedDottedWhere(node: ts.Node): boolean {
+  if (!ts.isIdentifier(node) || node.text !== '$where') {
+    return false;
+  }
+  const access = node.parent;
+  if (!ts.isPropertyAccessExpression(access) || access.name !== node || isCalled(access)) {
+    return false;
+  }
+  const target = outermostWrapper(access);
+  const use = target.parent;
+  const assignsCode =
+    ts.isBinaryExpression(use) &&
+    use.left === target &&
+    CODE_ASSIGNMENT_OPERATORS.has(use.operatorToken.kind) &&
+    isJavaScriptSource(use.right);
+  return !assignsCode;
+}
+
 function findForbiddenTokens(sourceFile: ts.SourceFile): string[] {
   if (OPERATOR_GUARDS.has(sourceFile.fileName)) {
     return [];
@@ -411,8 +538,9 @@ function findForbiddenTokens(sourceFile: ts.SourceFile): string[] {
   const offenses: string[] = [];
   const visit = (node: ts.Node): void => {
     if (
-      ts.isStringLiteralLike(node) ||
-      (ts.isIdentifier(node) && !ts.isPropertySignature(node.parent))
+      !isUnjudgedDottedWhere(node) &&
+      (ts.isStringLiteralLike(node) ||
+        (ts.isIdentifier(node) && !ts.isPropertySignature(node.parent)))
     ) {
       for (const token of FORBIDDEN_TOKENS) {
         if (node.text === token || node.text.startsWith(`${token}.`)) {
@@ -456,6 +584,132 @@ function findMixedSelectStrings(sourceFile: ts.SourceFile): string[] {
         }
       }
     }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return offenses;
+}
+
+/**
+ * Regression guard for the combined update shape reported in #16163, not a
+ * declaration that all MongoDB-compatible engines reject it. Resolve simple
+ * lexical aliases and spreads only when they feed a $bit field. This is a
+ * syntactic backstop, not interprocedural dataflow or vendor certification.
+ */
+const BIT_OPERATORS = new Set(['and', 'or', 'xor']);
+
+function findCombinedBitOperators(sourceFile: ts.SourceFile): string[] {
+  const offenses: string[] = [];
+  const declarations = new Map<ts.Node, Map<string, ts.Expression | undefined>>();
+  const assignments: ts.BinaryExpression[] = [];
+  const isScope = (node: ts.Node) =>
+    ts.isBlock(node) || ts.isSourceFile(node) || ts.isFunctionLike(node);
+  const scopeOf = (node: ts.Node): ts.Node => {
+    let scope = node.parent;
+    while (scope.parent && !isScope(scope)) scope = scope.parent;
+    return scope;
+  };
+  const collect = (node: ts.Node): void => {
+    if ((ts.isVariableDeclaration(node) || ts.isParameter(node)) && ts.isIdentifier(node.name)) {
+      const scope = scopeOf(node);
+      const names = declarations.get(scope) ?? new Map();
+      names.set(node.name.text, node.initializer);
+      declarations.set(scope, names);
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      assignments.push(node);
+    }
+    ts.forEachChild(node, collect);
+  };
+  collect(sourceFile);
+
+  const binding = (identifier: ts.Identifier) => {
+    let scope: ts.Node | undefined = identifier.parent;
+    while (scope) {
+      const names = declarations.get(scope);
+      if (names?.has(identifier.text)) return { scope, value: names.get(identifier.text) };
+      scope = scope.parent;
+    }
+    return undefined;
+  };
+  const propertyKey = (node: ts.PropertyAccessExpression | ts.ElementAccessExpression) => {
+    if (ts.isPropertyAccessExpression(node)) return node.name.text;
+    return ts.isStringLiteralLike(node.argumentExpression)
+      ? node.argumentExpression.text
+      : undefined;
+  };
+  const literal = (
+    expression: ts.Expression,
+    seen = new Set<ts.Node>(),
+  ): ts.ObjectLiteralExpression | undefined => {
+    const value = unwrapExpression(expression);
+    if (seen.has(value)) return undefined;
+    seen.add(value);
+    if (ts.isObjectLiteralExpression(value)) return value;
+    if (ts.isIdentifier(value)) {
+      const found = binding(value)?.value;
+      if (found) return literal(found, seen);
+    }
+    return undefined;
+  };
+  const operatorKeys = (expression: ts.Expression, seen = new Set<ts.Node>()): Set<string> => {
+    const keys = new Set<string>();
+    const value = unwrapExpression(expression);
+    if (seen.has(value)) return keys;
+    seen.add(value);
+    if (ts.isIdentifier(value)) {
+      const found = binding(value);
+      if (found?.value) for (const key of operatorKeys(found.value, seen)) keys.add(key);
+      for (const assignment of assignments) {
+        if (
+          !(
+            ts.isPropertyAccessExpression(assignment.left) ||
+            ts.isElementAccessExpression(assignment.left)
+          )
+        )
+          continue;
+        const target = unwrapExpression(assignment.left.expression);
+        const key = propertyKey(assignment.left);
+        if (
+          ts.isIdentifier(target) &&
+          target.text === value.text &&
+          binding(target)?.scope === found?.scope &&
+          key &&
+          BIT_OPERATORS.has(key)
+        )
+          keys.add(key);
+      }
+    } else if (ts.isObjectLiteralExpression(value)) {
+      for (const property of value.properties) {
+        const key = propertyName(property);
+        if (key && BIT_OPERATORS.has(key)) keys.add(key);
+        if (ts.isSpreadAssignment(property)) {
+          for (const spreadKey of operatorKeys(property.expression, seen)) keys.add(spreadKey);
+        }
+      }
+    }
+    return keys;
+  };
+  const inspectDocument = (expression: ts.Expression): void => {
+    const document = literal(expression);
+    if (!document) return;
+    for (const field of document.properties) {
+      const bag = ts.isPropertyAssignment(field) ? field.initializer : undefined;
+      if (bag && operatorKeys(bag).size > 1) {
+        offenses.push(offenseAt(sourceFile, field, `$bit.${propertyName(field) ?? '?'}`));
+      }
+    }
+  };
+  const visit = (node: ts.Node): void => {
+    if (ts.isPropertyAssignment(node) && propertyName(node) === '$bit')
+      inspectDocument(node.initializer);
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      (ts.isPropertyAccessExpression(node.left) || ts.isElementAccessExpression(node.left)) &&
+      propertyKey(node.left) === '$bit'
+    )
+      inspectDocument(node.right);
     ts.forEachChild(node, visit);
   };
   visit(sourceFile);
@@ -613,6 +867,10 @@ describe('Amazon DocumentDB compatibility', () => {
     expect(parsedSources.flatMap(findMixedSelectStrings)).toEqual([]);
   });
 
+  it('combines no $bit operators on one field', () => {
+    expect(parsedSources.flatMap(findCombinedBitOperators)).toEqual([]);
+  });
+
   it('uses no $set or $unset pipeline stages', () => {
     expect(parsedSources.flatMap(findAliasStages)).toEqual([]);
   });
@@ -623,6 +881,28 @@ describe('Amazon DocumentDB compatibility', () => {
 
   it('builds every index through the retrying helpers', () => {
     expect(parsedSources.flatMap(findRawIndexBuilds)).toEqual([]);
+  });
+
+  it('keeps marketplace author lookups in the DocumentDB-compatible form', () => {
+    const agentSource = parsedSources.find(
+      (source) => source.fileName === 'packages/data-schemas/src/methods/agent.ts',
+    );
+    expect(agentSource).toBeDefined();
+    expect(agentSource ? findCorrelatedLookups(agentSource) : []).toEqual([]);
+  });
+
+  it('flags a correlated $lookup let/pipeline form', () => {
+    const incompatible = parse(
+      'fixture.ts',
+      `Model.aggregate([{ $lookup: { from: 'users', let: { id: '$_id' }, pipeline: [], as: 'owner' } }]);`,
+    );
+    const classic = parse(
+      'fixture.ts',
+      `Model.aggregate([{ $lookup: { from: 'users', localField: 'ownerId', foreignField: '_id', as: 'owner' } }]);`,
+    );
+
+    expect(findCorrelatedLookups(incompatible)).not.toEqual([]);
+    expect(findCorrelatedLookups(classic)).toEqual([]);
   });
 
   /** A guard that cannot fail protects nothing, so every shape the detectors
@@ -676,6 +956,10 @@ describe('Amazon DocumentDB compatibility', () => {
         'annotated variable with a builder initializer',
         `const update: PipelineStage[] = importedBuilder();\nModel.updateMany(filter, update);`,
       ],
+      [
+        'angle-bracket cast literal',
+        `Model.updateOne(filter, <PipelineStage[]>[{ $set: { a: 1 } }]);`,
+      ],
     ])('flags a pipeline update: %s', (_shape, source) => {
       expect(findPipelineUpdates(parse('fixture.ts', source))).not.toEqual([]);
     });
@@ -693,6 +977,66 @@ describe('Amazon DocumentDB compatibility', () => {
       ],
     ])('accepts a supported shape: %s', (_shape, source) => {
       expect(findPipelineUpdates(parse('fixture.ts', source))).toEqual([]);
+    });
+
+    it.each([
+      [
+        'literal combination',
+        `Model.updateOne(filter, { $bit: { permBits: { or: 1, and: -2 } } });`,
+      ],
+      [
+        'bulk payload combination',
+        `await Model.bulkWrite([{ updateMany: { filter, update: { $bit: { p: { or: 1, and: -2 } } } } }]);`,
+      ],
+      ['three operators', `Model.updateOne(filter, { $bit: { p: { or: 1, and: -2, xor: 4 } } });`],
+      [
+        'bag merged by spread',
+        `const first = { or: 1 }; Model.updateOne(q, { $bit: { permBits: { ...first, and: -2 } } });`,
+      ],
+      [
+        'combined bag reached through a variable',
+        `const ops = { or: 1, and: -2 };\nModel.updateOne(filter, { $bit: { permBits: ops } });`,
+      ],
+      [
+        'operator added to a bag after its literal',
+        `const ops = { or: 1 };\nops.and = -2;\nModel.updateOne(filter, { $bit: { permBits: ops } });`,
+      ],
+      [
+        'bag merged behind a cast',
+        `const first = { or: 1 }; Model.updateOne(q, { $bit: { permBits: { ...(first as Record<string, unknown>), and: -2 } } });`,
+      ],
+    ])('flags a combined $bit update: %s', (_shape, source) => {
+      expect(findCombinedBitOperators(parse('fixture.ts', source))).not.toEqual([]);
+    });
+
+    it.each([
+      ['single or', `Model.updateOne(filter, { $bit: { permBits: { or: 1 } } });`],
+      ['single and', `Model.findOneAndUpdate(filter, { $bit: { permBits: { and: -2 } } });`],
+      [
+        'one operator per field on two fields',
+        `Model.updateOne(filter, { $bit: { a: { or: 1 }, b: { and: -2 } } });`,
+      ],
+      ['spread without an operator key', `const update = { ...base, permBits: 3 };`],
+      [
+        'single-operator bag reached through a variable',
+        `const ops = { or: 1 };\nModel.updateOne(filter, { $bit: { permBits: ops } });`,
+      ],
+      ['unrelated and/or naming', `const flags = { and: true, or: false };`],
+      ['unrelated spread bag', `const flags = { ...base, and: true };`],
+      [
+        'repeated same operator',
+        `const ops = { or: 1 }; ops.or = 2; Model.updateOne(q, { $bit: { p: ops } });`,
+      ],
+      [
+        'shadowed alias',
+        `const ops = { or: 1, and: -2 }; function f() { const ops = { or: 1 }; Model.updateOne(q, { $bit: { p: ops } }); }`,
+      ],
+      [
+        'shadowed assignment',
+        `const ops = { or: 1 }; function f() { const ops = {}; ops.and = -2; } Model.updateOne(q, { $bit: { p: ops } });`,
+      ],
+    ])('accepts a single-operator $bit shape: %s', (_shape, source) => {
+      expect(findCombinedBitOperators(parse('fixture.ts', source))).toEqual([]);
     });
 
     it.each([
@@ -730,6 +1074,105 @@ describe('Amazon DocumentDB compatibility', () => {
           parse('fixture.ts', `interface Doc { $where: Record<string, unknown> }`),
         ),
       ).toEqual([]);
+      /** A dotted `$where` is judged only where the syntax is unambiguous. Not
+       * claimed either way — Mongoose's document save-condition bag in
+       * `tenantIsolation.ts` is read and written exactly like this: */
+      expect(findForbiddenTokens(parse('fixture.ts', `const where = document.$where;`))).toEqual(
+        [],
+      );
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `document.$where = { tenantId: predicate };`)),
+      ).toEqual([]);
+      expect(
+        findForbiddenTokens(
+          parse('fixture.ts', `document.$where = Object.keys(rest).length > 0 ? rest : undefined;`),
+        ),
+      ).toEqual([]);
+      /** ...including a non-literal assigned to a filter, which no syntax can tell
+       * from the bag write; the method sweep and the live run are the backstop. */
+      expect(findForbiddenTokens(parse('fixture.ts', `filter.$where = predicate;`))).toEqual([]);
+      /** ...and a bag field that happens to be named like a call forwarder. */
+      expect(findForbiddenTokens(parse('fixture.ts', `document.$where.call = expected;`))).toEqual(
+        [],
+      );
+      /** Every way of writing the operator itself is an offense: */
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `const filter = { $where: 'this.a == 1' };`)),
+      ).not.toEqual([]);
+      expect(findForbiddenTokens(parse('fixture.ts', `const op = '$where';`))).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `filter['$where'] = 'this.a == 1';`)),
+      ).not.toEqual([]);
+      /** ...and so is a dotted `$where` that is called or assigned code: */
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `filter.$where = 'this.a == 1';`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', 'filter.$where = `this.a == ${value}`;')),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `filter.$where = () => this.a == 1;`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `query.$where(function () { return true; });`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `Model.find().$where('this.a == 1');`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `(query.$where)('this.a == 1');`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `query.$where.call(query, 'this.a == 1');`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `query.$where.apply(query, ['this.a == 1']);`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `const w = query.$where.bind(query);`)),
+      ).not.toEqual([]);
+      expect(findForbiddenTokens(parse('fixture.ts', `this.$where('this.a == 1');`))).not.toEqual(
+        [],
+      );
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `document.$where('this.a == 1');`)),
+      ).not.toEqual([]);
+      /** The assignment target and the assigned value may each be wrapped, the
+       * operator may append, and a forwarder may be reached by element access. */
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `(filter.$where as string) = 'this.a == 1';`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `filter.$where! = 'this.a == 1';`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `filter.$where += ' && this.b == 2';`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `filter.$where = <string>'this.a == 1';`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `query.$where['call'](query, 'this.a == 1');`)),
+      ).not.toEqual([]);
+      /** Compound assignments of code, and calls through TypeScript's transparent
+       * wrappers, are the same two shapes spelled differently. */
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `filter.$where ??= 'this.a == 1';`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `filter.$where ||= () => this.a == 1;`)),
+      ).not.toEqual([]);
+      expect(
+        findForbiddenTokens(
+          parse('fixture.ts', `(query.$where as typeof query.$where)('this.a == 1');`),
+        ),
+      ).not.toEqual([]);
+      expect(findForbiddenTokens(parse('fixture.ts', `query.$where!('this.a == 1');`))).not.toEqual(
+        [],
+      );
+      expect(
+        findForbiddenTokens(parse('fixture.ts', `(query.$where!).call(query, 'this.a == 1');`)),
+      ).not.toEqual([]);
     });
 
     it.each([

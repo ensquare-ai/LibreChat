@@ -1,11 +1,16 @@
 import { logger } from '@librechat/data-schemas';
-import { ContentTypes, isAgentsEndpoint } from 'librechat-data-provider';
+import {
+  ContentTypes,
+  isAgentsEndpoint,
+  DEFAULT_MAX_RETAINED_TOOL_COUNT_CHARS,
+} from 'librechat-data-provider';
 import {
   labelContentByAgent,
   extractImageDimensions,
   getTokenCountForMessage,
   estimateOpenAIImageTokens,
   estimateAnthropicImageTokens,
+  estimateTimedMediaBlockTokens,
   markTokenCounterCacheCompatible,
 } from '@librechat/agents';
 import type { MessageContentComplex, TokenCounter } from '@librechat/agents';
@@ -38,7 +43,24 @@ export function payloadParser({
   if (isAgentsEndpoint(endpoint)) {
     return;
   }
-  return req.body?.endpointOption?.model_parameters;
+  const modelParameters = req.body?.endpointOption?.model_parameters;
+  if (modelParameters == null || req.reasoningOverrideBase == null) {
+    return modelParameters;
+  }
+
+  const { key, hadValue, value } = req.reasoningOverrideBase;
+  const persistedParameters = { ...modelParameters };
+  if (hadValue) {
+    persistedParameters[key] = value;
+  } else {
+    delete persistedParameters[key];
+  }
+  if (req.reasoningOverrideBase.thinkingHadValue === true) {
+    persistedParameters.thinking = req.reasoningOverrideBase.thinkingValue;
+  } else if (req.reasoningOverrideBase.thinkingHadValue === false) {
+    delete persistedParameters.thinking;
+  }
+  return persistedParameters;
 }
 
 /**
@@ -59,9 +81,10 @@ type ContentBlock = {
   source?: { type?: string; data?: string; media_type?: string; content?: unknown[] };
   source_type?: string;
   mime_type?: string;
+  mimeType?: string;
   data?: string;
   text?: string;
-  tool_call?: { name?: string; args?: string; output?: string };
+  tool_call?: { id?: string; name?: string; args?: string; output?: string };
 };
 
 export type FormattedMessageContentPart = {
@@ -102,16 +125,24 @@ export function applyAttachmentOnlyText(
   formattedMessage.content = ATTACHMENT_ONLY_TEXT;
 }
 
-export function prependFileContext(
+/**
+ * Prepends context text to a formatted message: joined ahead of its string
+ * content or first text part, or added as a leading text part when it has
+ * neither. Array content is replaced, never edited in place: a formatted copy
+ * shares its array with the stored row it came from, so the stored row and
+ * every other reader of it stay untouched.
+ */
+export function prependContextText(
   formattedMessage: FormattedMessageWithContent,
-  fileContext?: string | null,
+  text: string | null | undefined,
+  separator = '\n',
 ): void {
-  if (!fileContext) {
+  if (!text) {
     return;
   }
 
   if (typeof formattedMessage.content === 'string') {
-    formattedMessage.content = `${fileContext}\n${formattedMessage.content}`;
+    formattedMessage.content = `${text}${separator}${formattedMessage.content}`;
     return;
   }
 
@@ -119,13 +150,24 @@ export function prependFileContext(
     return;
   }
 
-  const textPart = formattedMessage.content.find((part) => part.type === ContentTypes.TEXT);
-  if (textPart != null && typeof textPart.text === 'string') {
-    textPart.text = `${fileContext}\n${textPart.text}`;
+  const index = formattedMessage.content.findIndex(
+    (part) => part.type === ContentTypes.TEXT && typeof part.text === 'string',
+  );
+  if (index < 0) {
+    formattedMessage.content = [{ type: ContentTypes.TEXT, text }, ...formattedMessage.content];
     return;
   }
+  const textPart = formattedMessage.content[index];
+  formattedMessage.content = formattedMessage.content.map((part, position) =>
+    position === index ? { ...textPart, text: `${text}${separator}${textPart.text}` } : part,
+  );
+}
 
-  formattedMessage.content.unshift({ type: ContentTypes.TEXT, text: fileContext });
+export function prependFileContext(
+  formattedMessage: FormattedMessageWithContent,
+  fileContext?: string | null,
+): void {
+  prependContextText(formattedMessage, fileContext);
 }
 
 /**
@@ -261,32 +303,42 @@ function estimateDocumentBlockTokens(
 }
 
 /**
- * Estimates token cost for image and document blocks in a message's
- * content array. Covers: image_url, image, image_file, document, file.
+ * Google/Vertex native media blocks (`{ type: 'media', mimeType, data | fileUri }`), as built by
+ * the file encoders and YouTube links. Mirrors the agents SDK's media accounting so these blocks
+ * are not skipped by the precomputed context budget.
  */
-export function estimateMediaTokensForMessage(
-  content: unknown,
+function estimateMediaBlockTokens(
+  block: ContentBlock,
   isClaude: boolean,
-  getTokenCount?: (text: string) => number,
+  countTokens: (text: string) => number,
 ): number {
-  if (!Array.isArray(content)) {
-    return 0;
+  const mime = (block.mimeType ?? block.mime_type ?? '').split(';')[0].trim().toLowerCase();
+  const data = typeof block.data === 'string' && block.data.length > 0 ? block.data : undefined;
+
+  if (mime.startsWith('audio/') || mime.startsWith('video/')) {
+    const timed = estimateTimedMediaBlockTokens({ ...block, mimeType: mime });
+    return Math.ceil(timed * IMAGE_TOKEN_SAFETY_MARGIN);
   }
-  let tokens = 0;
-  for (const block of content as ContentBlock[]) {
-    if (block == null || typeof block !== 'object' || typeof block.type !== 'string') {
-      continue;
-    }
-    const type = block.type;
-    if (type === 'image_url' || type === 'image' || type === 'image_file') {
-      tokens += estimateImageBlockTokens(block, isClaude);
-      continue;
-    }
-    if (type === 'document' || type === 'file') {
-      tokens += estimateDocumentBlockTokens(block, isClaude, getTokenCount);
-    }
+  if (data == null) {
+    return mime.startsWith('image/') ? 1024 : URL_DOCUMENT_FALLBACK_TOKENS;
   }
-  return tokens;
+  if (mime.startsWith('image/')) {
+    return estimateImageDataTokens(data, isClaude);
+  }
+  if (mime === 'application/pdf') {
+    const comma = data.startsWith('data:') ? data.indexOf(',') : -1;
+    return estimateDocumentBlockTokens(
+      {
+        type: 'file',
+        source_type: 'base64',
+        mime_type: mime,
+        data: comma >= 0 ? data.slice(comma + 1) : data,
+      },
+      isClaude,
+      countTokens,
+    );
+  }
+  return Math.max(URL_DOCUMENT_FALLBACK_TOKENS, data.length);
 }
 
 /**
@@ -338,6 +390,11 @@ export function countFormattedMessageTokens(
           continue;
         }
 
+        if (type === 'media') {
+          numTokens += estimateMediaBlockTokens(block, isClaude, countTokens);
+          continue;
+        }
+
         if (type === ContentTypes.TOOL_CALL && block.tool_call != null) {
           const { name, args, output } = block.tool_call;
           if (typeof name === 'string' && name) {
@@ -379,12 +436,95 @@ export function countFormattedMessageTokens(
   return isClaude ? Math.ceil(numTokens * CLAUDE_TOKEN_CORRECTION) : numTokens;
 }
 
-export function createTokenCounter(
-  encoding: Parameters<typeof Tokenizer.getTokenCount>[1],
-): TokenCounter {
-  return createMessageTokenCounter(encoding, (text: string) =>
-    Tokenizer.getTokenCount(text, encoding),
-  );
+/**
+ * Exact token count of the tool results a turn retains beyond its last context
+ * snapshot.
+ *
+ * Snapshots are dispatched pre-invoke, so the results of the tools the call they
+ * precede requested are never in them; normally the next call's snapshot carries
+ * those results as kept-message context, but a run that stops at the tool-call
+ * limit makes no next call — the result stays on the response and in no snapshot.
+ * `priorToolCallIds` are the calls the last snapshot already saw, so a call whose
+ * id is absent from it belongs to that final, unsnapshotted step. The boundary is
+ * the call id rather than a content index because completion reshapes the array —
+ * skill cards are unshifted onto the front and `hide_sequential_outputs` replaces
+ * it with a filtered one — so any index recorded mid-run means something else by
+ * the time the turn is saved. A call with no id cannot be placed and is skipped.
+ *
+ * Only the tool OUTPUT counts. A call's name and arguments are model output,
+ * already carried by the snapshot's `completedOutputTokens`, so counting them
+ * again would double them. The result-message framing the next turn adds (role,
+ * tool_call_id, per-message overhead) is left out as well: the figure is added to
+ * exact provider accounting, so it errs low rather than overstating the context.
+ * Non-string outputs are skipped, matching {@link countFormattedMessageTokens}.
+ *
+ * `maxCountChars` bounds the tokenization this turn may cost — one call can request
+ * several tools, so the budget spans all their results — and `countExact` returns
+ * `undefined` for content it cannot count exactly. Either limit withdraws the whole
+ * figure: a turn whose gauge is missing the retained result is better than one
+ * whose exact figures absorbed a guess. The Claude framing correction is applied,
+ * matching the counter that produced the snapshot.
+ */
+export function countRetainedToolTokens({
+  contentParts,
+  priorToolCallIds,
+  countExact,
+  maxCountChars = DEFAULT_MAX_RETAINED_TOOL_COUNT_CHARS,
+  isClaude = false,
+}: {
+  contentParts: ReadonlyArray<unknown> | null | undefined;
+  priorToolCallIds: ReadonlySet<string> | null | undefined;
+  countExact: (text: string) => number | undefined;
+  maxCountChars?: number;
+  isClaude?: boolean;
+}): number | undefined {
+  if (!Array.isArray(contentParts)) {
+    return 0;
+  }
+  let tokens = 0;
+  let charactersCounted = 0;
+  for (const candidate of contentParts) {
+    const part = candidate as ContentBlock | null | undefined;
+    if (part == null || part.type !== ContentTypes.TOOL_CALL) {
+      continue;
+    }
+    const { id, output } = part.tool_call ?? {};
+    if (typeof id !== 'string' || id.length === 0 || priorToolCallIds?.has(id) === true) {
+      continue;
+    }
+    if (typeof output !== 'string' || output.length === 0) {
+      continue;
+    }
+    charactersCounted += output.length;
+    if (charactersCounted > maxCountChars) {
+      return undefined;
+    }
+    const counted = countExact(output);
+    if (counted == null) {
+      return undefined;
+    }
+    tokens += counted;
+  }
+  return isClaude ? Math.ceil(tokens * CLAUDE_TOKEN_CORRECTION) : tokens;
+}
+
+/** The tool calls a content array carries, by provider id — the boundary a later
+ *  save path measures "retained past this snapshot" against. */
+export function collectToolCallIds(
+  contentParts: ReadonlyArray<unknown> | null | undefined,
+): Set<string> {
+  const ids = new Set<string>();
+  if (!Array.isArray(contentParts)) {
+    return ids;
+  }
+  for (const candidate of contentParts) {
+    const part = candidate as ContentBlock | null | undefined;
+    const id = part?.type === ContentTypes.TOOL_CALL ? part.tool_call?.id : undefined;
+    if (typeof id === 'string' && id.length > 0) {
+      ids.add(id);
+    }
+  }
+  return ids;
 }
 
 function createMessageTokenCounter(

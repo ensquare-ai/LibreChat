@@ -20,6 +20,7 @@
  */
 const express = require('express');
 const {
+  reportLocatorTraversalFailure,
   createAgentEventBindingHandlers,
   createAgentTriggerIngressHandlers,
   createMessageFilterPii,
@@ -29,7 +30,11 @@ const {
   ListModelsController,
   GetModelController,
 } = require('~/server/controllers/agents/openai');
-const { agentEventUserLimiter, configMiddleware } = require('~/server/middleware');
+const {
+  configMiddleware,
+  agentEventUserLimiter,
+  requireTermsAcceptance,
+} = require('~/server/middleware');
 const {
   enqueueAgentTrigger,
   getAgentTriggerDeliveryStatus,
@@ -59,6 +64,7 @@ const eventBindingHandlers = createAgentEventBindingHandlers({
 
 router.use(preAuthTenantMiddleware);
 router.use(requireRemoteAgentAuth);
+router.use(requireTermsAcceptance);
 router.use(configMiddleware);
 router.use(checkRemoteAgentsFeature);
 
@@ -82,7 +88,10 @@ router.post(
 router.post(
   '/events',
   agentEventUserLimiter,
-  createMessageFilterPii({ getConfig: (req) => req.config?.messageFilter?.pii }),
+  createMessageFilterPii({
+    onTraversalFailure: reportLocatorTraversalFailure,
+    getConfig: (req) => req.config?.messageFilter?.pii,
+  }),
   eventBindingHandlers.resolve,
   checkAgentTriggerPermission,
   eventHandlers.enqueueEvent,

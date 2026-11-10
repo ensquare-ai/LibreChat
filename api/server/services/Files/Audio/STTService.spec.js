@@ -44,6 +44,7 @@ jest.mock('@librechat/api', () => ({
     field: finding.field,
   })),
   getBlockedUninspectableFileField: jest.fn(),
+  configuredRequestBudget: jest.fn(() => ({ timeout: 1000 })),
   contentFilterUninspectableResponse: jest.fn((field) => ({
     error: 'content_filter_uninspectable',
     source: 'file',
@@ -52,6 +53,9 @@ jest.mock('@librechat/api', () => ({
 }));
 jest.mock('librechat-data-provider', () => ({
   extractEnvVariable: jest.fn(),
+  /* Real selection logic: these tests are about which provider a schema resolves to. */
+  listConfiguredSpeechProviders:
+    jest.requireActual('librechat-data-provider').listConfiguredSpeechProviders,
   STTProviders: {},
 }));
 jest.mock('~/server/services/Config', () => ({ getAppConfig: jest.fn() }));

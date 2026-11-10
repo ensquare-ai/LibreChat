@@ -1,5 +1,6 @@
 import { isMainThread } from 'node:worker_threads';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { PrincipalType } from 'librechat-data-provider';
 import {
   logger,
   configCapability,
@@ -61,6 +62,7 @@ export type HasCapabilityFn = (
 
 export type RequireCapabilityFn = (
   capability: SystemCapability,
+  options?: { platformOnly?: boolean },
 ) => (req: ServerRequest, res: Response, next: NextFunction) => Promise<void>;
 
 export type HasConfigCapabilityFn = (
@@ -214,6 +216,7 @@ export function generateCapabilityCheck(deps: CapabilityDeps): {
   async function hasCapability(
     user: CapabilityUser,
     capability: SystemCapability,
+    { platformOnly = false }: { platformOnly?: boolean } = {},
   ): Promise<boolean> {
     if (!isMainThread && !workerWarned) {
       workerWarned = true;
@@ -226,17 +229,21 @@ export function generateCapabilityCheck(deps: CapabilityDeps): {
 
     const store = capabilityStore.getStore();
 
-    const resultKey = `${user.id}:${user.tenantId ?? ''}:${capability}`;
+    const resultKey = `${user.id}:${user.tenantId ?? ''}:${capability}:${platformOnly ? 'platform' : 'tenant'}`;
     const cached = store?.results.get(resultKey);
     if (cached !== undefined) {
       return cached;
     }
 
-    const principals = await resolvePrincipals(user);
+    const resolvedPrincipals = await resolvePrincipals(user);
+    const principals =
+      platformOnly && user.tenantId
+        ? resolvedPrincipals.filter(({ principalType }) => principalType === PrincipalType.USER)
+        : resolvedPrincipals;
     const result = await hasCapabilityForPrincipals({
       principals,
       capability,
-      tenantId: user.tenantId,
+      tenantId: platformOnly ? undefined : user.tenantId,
     });
     store?.results.set(resultKey, result);
     return result;
@@ -265,17 +272,20 @@ export function generateCapabilityCheck(deps: CapabilityDeps): {
     return hasCapability(user, sectionCap);
   }
 
-  function requireCapability(capability: SystemCapability) {
+  function requireCapability(
+    capability: SystemCapability,
+    { platformOnly = false }: { platformOnly?: boolean } = {},
+  ) {
     return async (req: ServerRequest, res: Response, next: NextFunction) => {
       try {
         if (!req.user) {
-          res.status(401).json({ message: 'Authentication required' });
+          res.status(401).json({ message: 'Authentication required', code: 'AUTH_REQUIRED' });
           return;
         }
 
         const id = req.user.id ?? req.user._id?.toString();
         if (!id) {
-          res.status(401).json({ message: 'Authentication required' });
+          res.status(401).json({ message: 'Authentication required', code: 'AUTH_REQUIRED' });
           return;
         }
 
@@ -286,7 +296,7 @@ export function generateCapabilityCheck(deps: CapabilityDeps): {
           idOnTheSource: req.user.idOnTheSource ?? null,
         };
 
-        if (await hasCapability(user, capability)) {
+        if (await hasCapability(user, capability, { platformOnly })) {
           next();
           return;
         }
@@ -295,7 +305,7 @@ export function generateCapabilityCheck(deps: CapabilityDeps): {
           `missing-capability:${id}:${capability}`,
           `[requireCapability] Forbidden: user ${id} missing capability '${capability}'`,
         );
-        res.status(403).json({ message: 'Forbidden' });
+        res.status(403).json({ message: 'Forbidden', code: 'FORBIDDEN' });
       } catch (err) {
         logger.error(`[requireCapability] Error checking capability: ${capability}`, err);
         res.status(500).json({ message: 'Internal Server Error' });

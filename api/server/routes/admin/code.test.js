@@ -30,6 +30,7 @@ jest.mock('@librechat/data-schemas', () => ({
 
 jest.mock('@librechat/api', () => ({
   createAdminCodeEnvironmentHandlers: jest.fn(() => mockHandlers),
+  isAuditFailClosed: jest.fn(() => true),
 }));
 
 jest.mock('~/server/middleware/roles/capabilities', () => ({
@@ -42,6 +43,10 @@ jest.mock('~/server/middleware', () => ({
 
 jest.mock('~/server/services/Config', () => ({
   getAppConfig: mockGetAppConfig,
+}));
+
+jest.mock('~/models', () => ({
+  recordAuditEntry: jest.fn(),
 }));
 
 function createApp() {
@@ -70,5 +75,10 @@ describe('admin code environment routes', () => {
     expect(response.body).toEqual({ operation, environmentId: 'attached-vm' });
     expect(middlewareCalls).toEqual(['jwt', 'access:admin', 'manage:code_environments']);
     expect(mockHandlers[handlerName]).toHaveBeenCalledTimes(1);
+    if (path === 'pairings') {
+      expect(mockRequireCapability).toHaveBeenCalledWith('manage:code_environments', {
+        platformOnly: true,
+      });
+    }
   });
 });

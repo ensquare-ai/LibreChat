@@ -9,11 +9,15 @@ const mockGetOpenAIClient = jest.fn();
 const mockUpdateAssistantDoc = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({ logger: mockLogger }));
-jest.mock('@librechat/api', () => ({}));
+jest.mock('@librechat/api', () => ({
+  createAssistantRetriever: jest.fn(() => jest.fn()),
+  resolveAssistantToolPermissions: jest.fn(async () => () => true),
+}));
 jest.mock('librechat-data-provider', () => ({
   FileContext: { avatar: 'avatar' },
   ToolCallTypes: {},
 }));
+jest.mock('~/server/middleware/roles/capabilities', () => ({ hasCapability: jest.fn() }));
 jest.mock('~/models', () => ({
   deleteFileByFilter: jest.fn(),
   updateAssistantDoc: mockUpdateAssistantDoc,

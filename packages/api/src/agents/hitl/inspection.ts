@@ -9,14 +9,16 @@ import {
 import type { Agent, FiltersConfig, UserSubmittedMessageFieldPath } from 'librechat-data-provider';
 import type { AppConfig, IUser } from '@librechat/data-schemas';
 import type { StoredMessageContentInput } from '~/protection/adapters/submissions';
+import type { LocatorTraversalReporter } from '../../protection/diagnostics';
 import type { ExternalChatMessage } from '~/protection/adapters/messages';
 import {
   hasActiveFilePolicy,
-  resolveCanonicalFileReferences,
+  resolveCanonicalFileReferenceUnits,
   type GetCanonicalFilesForInspection,
   type CanonicalFileInspectionFile,
 } from '~/protection/files';
 import { ContentTraversalLimitError } from '~/protection/adapters/nested';
+import { getLookupConcurrency } from '~/utils/concurrency';
 import { collectReachableAgents } from '../traversal';
 import { getEdgeParticipants } from '../edges';
 
@@ -61,6 +63,7 @@ interface ResumeAgentSnapshotInput {
   subagentsEnabled: boolean;
   getAgent: (filter: { id: string }) => Promise<Agent | null>;
   canAccessAgent?: (agent: Agent) => Promise<boolean>;
+  appConfig?: Pick<AppConfig, 'concurrency'>;
 }
 
 type GetResumeMessages = (filter: {
@@ -69,6 +72,7 @@ type GetResumeMessages = (filter: {
 }) => Promise<ResumeMessage[] | null | undefined>;
 
 export interface ResumeContentInspectionInput {
+  readonly onTraversalFailure?: LocatorTraversalReporter;
   appConfig?: AppConfig;
   conversationId: string;
   targetMessageId?: string | null;
@@ -150,6 +154,7 @@ export async function getResumeAgentSnapshot({
   subagentsEnabled,
   getAgent,
   canAccessAgent,
+  appConfig,
 }: ResumeAgentSnapshotInput): Promise<ResumeSnapshotAgent[]> {
   const primary: ResumeSnapshotAgent = {
     ...primaryAgent,
@@ -159,6 +164,7 @@ export async function getResumeAgentSnapshot({
     },
     subagentAgentConfigs: [],
   };
+  const resumeLoadConcurrency = getLookupConcurrency(appConfig, 'resumeAgentLoads');
   const roots: ResumeSnapshotAgent[] = [primary];
   const byId = new Map<string, ResumeSnapshotAgent>([[primary.id, primary]]);
 
@@ -178,29 +184,44 @@ export async function getResumeAgentSnapshot({
     for (let index = 0; index < pending.length; index++) {
       const { agent, includeLegacyChain } = pending[index];
       const children: ResumeSnapshotAgent[] = [];
-      for (const id of getReferencedAgentIds(agent, subagentsEnabled, includeLegacyChain)) {
-        let child = byId.get(id);
-        if (!child) {
-          let loaded: Agent | null;
-          try {
-            loaded = await getAgent({ id });
-          } catch {
-            throw new ContentTraversalLimitError();
+      const referencedIds = getReferencedAgentIds(agent, subagentsEnabled, includeLegacyChain);
+      /** Fetch one small chunk of unseen references together, then fold it in reference
+       *  order, so the node limit and de-duplication match a serial walk, a failed lookup
+       *  rejects at once, and an over-budget graph stops fetching after at most one chunk. */
+      for (let start = 0; start < referencedIds.length; start += resumeLoadConcurrency) {
+        const chunk = referencedIds.slice(start, start + resumeLoadConcurrency);
+        const unseenIds = [...new Set(chunk)].filter((id) => !byId.has(id));
+        const fetched = new Map<string, Agent | null>();
+        await Promise.all(
+          unseenIds.map(async (id) => {
+            let loaded: Agent | null;
+            try {
+              loaded = await getAgent({ id });
+            } catch {
+              throw new ContentTraversalLimitError();
+            }
+            if (loaded && canAccessAgent && !(await canAccessAgent(loaded))) {
+              loaded = null;
+            }
+            fetched.set(id, loaded);
+          }),
+        );
+        for (const id of chunk) {
+          let child = byId.get(id);
+          if (!child) {
+            const loaded = fetched.get(id);
+            if (!loaded) {
+              continue;
+            }
+            if (byId.size >= MAX_SUBAGENT_GRAPH_NODES) {
+              throw new ContentTraversalLimitError();
+            }
+            child = { ...loaded, subagentAgentConfigs: [] };
+            byId.set(id, child);
+            pending.push({ agent: child, includeLegacyChain: false });
           }
-          if (!loaded) {
-            continue;
-          }
-          if (canAccessAgent && !(await canAccessAgent(loaded))) {
-            continue;
-          }
-          if (byId.size >= MAX_SUBAGENT_GRAPH_NODES) {
-            throw new ContentTraversalLimitError();
-          }
-          child = { ...loaded, subagentAgentConfigs: [] };
-          byId.set(id, child);
-          pending.push({ agent: child, includeLegacyChain: false });
+          children.push(child);
         }
-        children.push(child);
       }
       agent.subagentAgentConfigs = children;
     }
@@ -368,14 +389,16 @@ async function getResumeFileInspection(
     };
   }
 
-  const originalInput = {
-    storedMessages,
-    submittedMessages: input.submittedMessages,
-    fileReferenceInputs: input.fileReferenceInputs ?? [],
-  };
-  const fileInspection = await resolveCanonicalFileReferences({
+  const units = [
+    ...storedMessages.map((storedMessage) => ({ storedMessage })),
+    ...input.submittedMessages.map((submittedMessage) => ({ submittedMessage })),
+    ...(input.fileReferenceInputs ?? []).map((fileReferenceInput) => ({ fileReferenceInput })),
+  ];
+  const fileInspection = await resolveCanonicalFileReferenceUnits({
+    messageCount: storedMessages.length + input.submittedMessages.length,
+    onTraversalFailure: input.onTraversalFailure,
     filters,
-    input: originalInput,
+    input: units,
     user: input.user,
     ...(input.trustLiveFileContent === true && {
       trustedLiveFiles: input.liveFiles,
@@ -383,8 +406,12 @@ async function getResumeFileInspection(
     getFiles: input.getFiles,
   });
   return {
-    storedMessages: fileInspection.sanitizedInput.storedMessages,
-    submittedMessages: fileInspection.sanitizedInput.submittedMessages,
+    storedMessages: fileInspection.sanitizedInput.flatMap((unit) =>
+      'storedMessage' in unit ? [unit.storedMessage] : [],
+    ),
+    submittedMessages: fileInspection.sanitizedInput.flatMap((unit) =>
+      'submittedMessage' in unit ? [unit.submittedMessage] : [],
+    ),
     originalStoredMessages: storedMessages,
     hydratedFiles: fileInspection.hydratedFiles,
     hydratedFilters: fileInspection.hydratedFilters,

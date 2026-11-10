@@ -12,9 +12,15 @@ interface AgentSubagentsProps {
   field: ControllerRenderProps<AgentForm, 'subagents'>;
   currentAgentId: string;
   maxSubagents: number;
+  fileSharingEnabled?: boolean;
 }
 
-const AgentSubagents: React.FC<AgentSubagentsProps> = ({ field, currentAgentId, maxSubagents }) => {
+const AgentSubagents: React.FC<AgentSubagentsProps> = ({
+  field,
+  currentAgentId,
+  maxSubagents,
+  fileSharingEnabled = false,
+}) => {
   const localize = useLocalize();
 
   const fieldValue = field.value;
@@ -48,6 +54,13 @@ const AgentSubagents: React.FC<AgentSubagentsProps> = ({ field, currentAgentId, 
   const setAllowSelf = useCallback(
     (next: boolean) => {
       field.onChange({ ...value, enabled: true, allowSelf: next });
+    },
+    [field, value],
+  );
+
+  const setShareFiles = useCallback(
+    (next: boolean) => {
+      field.onChange({ ...value, shareFiles: next });
     },
     [field, value],
   );
@@ -93,8 +106,8 @@ const AgentSubagents: React.FC<AgentSubagentsProps> = ({ field, currentAgentId, 
       beta
       info={
         <>
-          <p className="text-sm text-text-secondary">{localize('com_ui_agent_subagents_info')}</p>
-          <p className="text-sm text-text-secondary">{localize('com_ui_agent_subagents_info_2')}</p>
+          <p className="text-text-secondary text-sm">{localize('com_ui_agent_subagents_info')}</p>
+          <p className="text-text-secondary text-sm">{localize('com_ui_agent_subagents_info_2')}</p>
         </>
       }
       trailing={
@@ -113,11 +126,25 @@ const AgentSubagents: React.FC<AgentSubagentsProps> = ({ field, currentAgentId, 
             checked={allowSelf}
             onCheckedChange={setAllowSelf}
             info={
-              <p className="text-sm text-text-secondary">
+              <p className="text-text-secondary text-sm">
                 {localize('com_ui_agent_subagents_allow_self_info')}
               </p>
             }
           />
+
+          {fileSharingEnabled && (
+            <ToggleSetting
+              id="subagents-share-files-toggle"
+              label={localize('com_ui_agent_subagents_share_files')}
+              checked={value.shareFiles === true}
+              onCheckedChange={setShareFiles}
+              info={
+                <p className="text-text-secondary text-sm">
+                  {localize('com_ui_agent_subagents_share_files_info')}
+                </p>
+              }
+            />
+          )}
 
           <div className="flex flex-col gap-0.5">
             <ListMeta
@@ -151,14 +178,14 @@ const AgentSubagents: React.FC<AgentSubagentsProps> = ({ field, currentAgentId, 
             )}
 
             {agentIds.length >= maxSubagents && (
-              <p className="pt-1 text-center text-xs italic text-text-tertiary">
+              <p className="text-text-tertiary pt-1 text-center text-xs italic">
                 {localize('com_ui_agent_subagents_max', { 0: maxSubagents })}
               </p>
             )}
           </div>
 
           {nothingToSpawn && (
-            <p className="flex items-center gap-2 text-xs italic text-text-warning">
+            <p className="text-text-warning flex items-center gap-2 text-xs italic">
               <Users size={14} aria-hidden="true" />
               {localize('com_ui_agent_subagents_empty')}
             </p>

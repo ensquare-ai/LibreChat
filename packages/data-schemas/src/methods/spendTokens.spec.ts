@@ -19,9 +19,7 @@ let mongoServer: InstanceType<typeof MongoMemoryServer>;
 let spendTokens: ReturnType<typeof createSpendTokensMethods>['spendTokens'];
 let spendStructuredTokens: ReturnType<typeof createSpendTokensMethods>['spendStructuredTokens'];
 let createTransaction: ReturnType<typeof createTransactionMethods>['createTransaction'];
-let createAutoRefillTransaction: ReturnType<
-  typeof createTransactionMethods
->['createAutoRefillTransaction'];
+let updateBalance: ReturnType<typeof createTransactionMethods>['updateBalance'];
 let getCacheMultiplier: ReturnType<typeof createTxMethods>['getCacheMultiplier'];
 
 describe('spendTokens', () => {
@@ -47,7 +45,7 @@ describe('spendTokens', () => {
       getCacheMultiplier: txMethods.getCacheMultiplier,
     });
     createTransaction = transactionMethods.createTransaction;
-    createAutoRefillTransaction = transactionMethods.createAutoRefillTransaction;
+    updateBalance = transactionMethods.updateBalance;
 
     const spendMethods = createSpendTokensMethods(mongoose, {
       createTransaction: transactionMethods.createTransaction,
@@ -590,73 +588,24 @@ describe('spendTokens', () => {
     expect(Math.abs(totalTokenValue)).toBeCloseTo(actualSpend, -3); // Allow for larger differences
   });
 
-  // Add this new test case
   it('should handle multiple concurrent balance increases correctly', async () => {
-    // Start with zero balance
     const initialBalance = 0;
     await Balance.create({
       user: userId,
       tokenCredits: initialBalance,
     });
 
-    const numberOfRefills = 25;
-    const refillAmount = 1000;
+    const numberOfIncrements = 25;
+    const incrementValue = 1000;
 
-    const promises: Promise<unknown>[] = [];
-    for (let i = 0; i < numberOfRefills; i++) {
-      promises.push(
-        createAutoRefillTransaction({
-          user: userId,
-          tokenType: 'credits',
-          context: 'concurrent-refill-test',
-          rawAmount: refillAmount,
-          balance: { enabled: true },
-        }),
-      );
-    }
+    await Promise.all(
+      Array.from({ length: numberOfIncrements }, () =>
+        updateBalance({ user: userId.toString(), incrementValue }),
+      ),
+    );
 
-    // Wait for all refill transactions to complete
-    const results = await Promise.all(promises);
-
-    // Verify final balance
     const finalBalance = await Balance.findOne({ user: userId });
-    expect(finalBalance).toBeDefined();
-
-    // The final balance should be the initial balance plus the sum of all refills
-    const expectedFinalBalance = initialBalance + numberOfRefills * refillAmount;
-
-    // Use toBeCloseTo for safety, though toBe should work for integer math
-    expect(finalBalance!.tokenCredits).toBeCloseTo(expectedFinalBalance, 0);
-
-    // Verify all transactions were created
-    const transactions = await Transaction.find({
-      user: userId,
-      context: 'concurrent-refill-test',
-    });
-
-    // We should have one transaction for each refill attempt
-    expect(transactions.length).toBe(numberOfRefills);
-
-    // Optional: Verify the sum of increments from the results matches the balance change
-    const totalIncrementReported = results.reduce((sum: number, result) => {
-      // Assuming createAutoRefillTransaction returns an object with the increment amount
-      // Adjust this based on the actual return structure.
-      // Let's assume it returns { balance: newBalance, transaction: { rawAmount: ... } }
-      // Or perhaps we check the transaction.rawAmount directly
-      const r = result as Record<string, Record<string, unknown>>;
-      return sum + ((r?.transaction?.rawAmount as number) || 0);
-    }, 0);
-    expect(totalIncrementReported).toBe(expectedFinalBalance - initialBalance);
-
-    // Optional: Check the sum of tokenValue from saved transactions
-    let totalTokenValueFromDb = 0;
-    transactions.forEach((tx) => {
-      // For refills, rawAmount is positive, and tokenValue might be calculated based on it
-      // Let's assume tokenValue directly reflects the increment for simplicity here
-      // If calculation is involved, adjust accordingly
-      totalTokenValueFromDb += tx.rawAmount!; // Or tx.tokenValue if that holds the increment
-    });
-    expect(totalTokenValueFromDb).toBeCloseTo(expectedFinalBalance - initialBalance, 0);
+    expect(finalBalance!.tokenCredits).toBe(initialBalance + numberOfIncrements * incrementValue);
   });
 
   it('should create structured transactions for both prompt and completion tokens', async () => {
@@ -714,6 +663,57 @@ describe('spendTokens', () => {
     const balance = await Balance.findOne({ user: userId });
     expect(balance).toBeDefined();
     expect(balance!.tokenCredits).toBeLessThan(10000); // Balance should be reduced
+  });
+
+  describe('one-hour cache writes', () => {
+    const model = 'claude-sonnet-5-5';
+    const txData = () => ({
+      user: userId,
+      conversationId: 'convo-1h',
+      model,
+      context: 'message',
+      balance: { enabled: true },
+    });
+
+    beforeEach(async () => {
+      await Balance.create({ user: userId, tokenCredits: 100_000_000 });
+    });
+
+    it('bills the 1-hour share of the writes at the 1-hour rate', async () => {
+      const promptTokens = { input: 100, write: 3000, write1h: 2000, read: 500 };
+      const result = await spendStructuredTokens(txData(), { promptTokens });
+
+      const prompt = tokenValues[model].prompt;
+      const write5m = getCacheMultiplier({ model, cacheType: 'write' })!;
+      const write1h = getCacheMultiplier({ model, cacheType: 'write1h' })!;
+      const read = getCacheMultiplier({ model, cacheType: 'read' })!;
+      const expected = -(100 * prompt + 1000 * write5m + 2000 * write1h + 500 * read);
+      expect(result.prompt?.prompt).toBeCloseTo(expected);
+
+      const [doc] = await Transaction.find({ user: userId, tokenType: 'prompt' }).lean();
+      expect(doc.writeTokens).toBe(-3000);
+      expect(doc.tokenValue).toBeCloseTo(expected);
+    });
+
+    it('keeps 5-minute pricing when no 1-hour writes are reported', async () => {
+      const promptTokens = { input: 100, write: 3000, read: 500 };
+      const result = await spendStructuredTokens(txData(), { promptTokens });
+
+      const expected = -(
+        100 * tokenValues[model].prompt +
+        3000 * getCacheMultiplier({ model, cacheType: 'write' })! +
+        500 * getCacheMultiplier({ model, cacheType: 'read' })!
+      );
+      expect(result.prompt?.prompt).toBeCloseTo(expected);
+    });
+
+    it('never bills more 1-hour writes than writes', async () => {
+      const promptTokens = { input: 0, write: 1000, write1h: 5000, read: 0 };
+      const result = await spendStructuredTokens(txData(), { promptTokens });
+      expect(result.prompt?.prompt).toBeCloseTo(
+        -1000 * getCacheMultiplier({ model, cacheType: 'write1h' })!,
+      );
+    });
   });
 
   describe('premium token pricing', () => {

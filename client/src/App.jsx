@@ -2,18 +2,25 @@ import { useEffect } from 'react';
 import { RecoilRoot } from 'recoil';
 import { DndProvider } from 'react-dnd';
 import { RouterProvider } from 'react-router-dom';
-import * as RadixToast from '@radix-ui/react-toast';
 import { HTML5Backend } from 'react-dnd-html5-backend';
-import { Toast, ToastProvider, useInputModality } from '@librechat/client';
-import { QueryClient, QueryClientProvider, QueryCache } from '@tanstack/react-query';
-import ConfiguredThemeProvider from '~/components/System/ConfiguredThemeProvider';
+import { Toast, ToastViewport, ToastProvider, useInputModality } from '@librechat/client';
+import { QueryClient, QueryClientProvider, QueryCache, MutationCache } from '@tanstack/react-query';
+import { FilesHostProvider, appFilesHost } from '~/Providers/FilesHostContext';
+import Direction, { ToastSwipeProvider } from '~/Providers/Direction';
 import { ScreenshotProvider, useApiErrorBoundary } from './hooks';
 import WakeLockManager from '~/components/System/WakeLockManager';
 import QueryDevtoolsGate from '~/components/QueryDevtoolsGate';
 import LanguageSync from '~/components/System/LanguageSync';
+import ConfiguredThemeProvider from '~/components/System/ConfiguredThemeProvider';
+import UiScaleSync from '~/components/System/UiScaleSync';
 import { initializeFontSize } from '~/store/fontSize';
+import { reopenTermsOnRefusal } from '~/utils/terms';
 import { LiveAnnouncer } from '~/a11y';
 import { router } from './routes';
+import '~/Providers/MessagePartsHostContext';
+import '~/Providers/MessagesHostContext';
+import '~/Providers/SubagentsHostContext';
+import '~/components/Chat/Messages/Content/register';
 
 const App = () => {
   const { setError } = useApiErrorBoundary();
@@ -37,6 +44,11 @@ const App = () => {
         }
       },
     }),
+    mutationCache: new MutationCache({
+      onError: (error) => {
+        reopenTermsOnRefusal(queryClient, error?.response?.data);
+      },
+    }),
   });
 
   useEffect(() => {
@@ -47,17 +59,22 @@ const App = () => {
     <QueryClientProvider client={queryClient}>
       <RecoilRoot>
         <LanguageSync />
-        <LiveAnnouncer>
-          {/* Reads the deployment's theme from the startup config, validates it with
-              upstream's validator, and leaves the bundled default rendering if it
-              does not pass. The environment path is unchanged and still applies
-              when nothing is configured. The router is how the loader knows whether
-              the visitor is on a sign-in screen, for a theme confined to those. */}
-          <ConfiguredThemeProvider router={router}>
-            <RadixToast.Provider>
-              <ToastProvider>
-                <DndProvider backend={HTML5Backend}>
-                  {/* Location updates commit in the caller's own task instead
+        <UiScaleSync />
+        <Direction>
+          <LiveAnnouncer>
+            {/* Reads the deployment's theme from the startup config, validates it with
+                upstream's validator, and leaves the bundled default rendering if it
+                does not pass. The environment path is unchanged and still applies
+                when nothing is configured. The router is how the loader knows whether
+                the visitor is on a sign-in screen, for a theme confined to those.
+                It stands where upstream's `DeploymentTheme` stands: both own the one
+                `ThemeProvider`, and `interface.theme` has no way to confine a theme
+                to the sign-in screens. */}
+            <ConfiguredThemeProvider router={router}>
+              <ToastSwipeProvider>
+                <ToastProvider>
+                  <DndProvider backend={HTML5Backend}>
+                    {/* Location updates commit in the caller's own task instead
                       of React's transition lane. A transition keeps the
                       OUTGOING route painted until the incoming one finishes
                       rendering, so switching conversations left the previous
@@ -76,16 +93,19 @@ const App = () => {
                       transition-safe reads are gated behind
                       `_TRANSITION_SUPPORT_UNSTABLE` hooks this app does not use.
                       Worth revisiting once that state has moved to Jotai. */}
-                  <RouterProvider router={router} useTransitions={false} />
-                  <WakeLockManager />
-                  <QueryDevtoolsGate />
-                  <Toast />
-                  <RadixToast.Viewport className="pointer-events-none fixed inset-x-0 top-0 z-[1000] mx-auto my-2 flex max-w-[560px] flex-col items-stretch justify-start" />
-                </DndProvider>
-              </ToastProvider>
-            </RadixToast.Provider>
-          </ConfiguredThemeProvider>
-        </LiveAnnouncer>
+                    <FilesHostProvider host={appFilesHost}>
+                      <RouterProvider router={router} useTransitions={false} />
+                    </FilesHostProvider>
+                    <WakeLockManager />
+                    <QueryDevtoolsGate />
+                    <Toast />
+                    <ToastViewport />
+                  </DndProvider>
+                </ToastProvider>
+              </ToastSwipeProvider>
+            </ConfiguredThemeProvider>
+          </LiveAnnouncer>
+        </Direction>
       </RecoilRoot>
     </QueryClientProvider>
   );
@@ -99,9 +119,7 @@ export default () => (
       allow="autoplay"
       id="audio"
       title="audio-silence"
-      style={{
-        display: 'none',
-      }}
+      className="hidden"
     />
   </ScreenshotProvider>
 );

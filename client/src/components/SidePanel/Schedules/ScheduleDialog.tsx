@@ -1,6 +1,7 @@
-import { useMemo, useRef } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { v4 } from 'uuid';
 import { Folder } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useForm, Controller } from 'react-hook-form';
 import {
@@ -49,9 +50,11 @@ import {
   useCreateScheduleMutation,
   useUpdateScheduleMutation,
 } from '~/data-provider';
+import { scheduleMCPErrorMessage, scheduleMCPErrorOutcomes } from './errors';
 import { useLocalize, useClockFormat, useWeekStart } from '~/hooks';
 import { useChatProjectPicker } from './useScheduleProjects';
 import { VariableEditor } from '~/components/Variables';
+import ScheduleMCPRecovery from './ScheduleMCPRecovery';
 import { rotateWeekFrom } from '~/utils/clock';
 import { cn } from '~/utils';
 
@@ -183,10 +186,14 @@ export default function ScheduleDialog({
   schedule,
   triggerRef,
 }: ScheduleDialogProps) {
+  const navigate = useNavigate();
   const localize = useLocalize();
   const { i18n } = useTranslation();
   const { showToast } = useToastContext();
   const locale = i18n.language;
+  const [mcpRecoveryOutcomes, setMCPRecoveryOutcomes] = useState<
+    ReturnType<typeof scheduleMCPErrorOutcomes>
+  >([]);
 
   const {
     control,
@@ -211,6 +218,7 @@ export default function ScheduleDialog({
   const daysOfWeek = watch('daysOfWeek');
   const expression = watch('expression');
   const timezone = watch('timezone');
+  const selectedAgentId = watch('agent_id');
   /** Not named `hour12`: that is already the form's own 12-hour clock VALUE (1-12).
    *  This is the preference deciding whether a time is written with a meridiem. */
   const prefersMeridiem = useClockFormat();
@@ -226,6 +234,10 @@ export default function ScheduleDialog({
 
   const agentItems = useMemo(
     () => (agents ?? []).map((agent) => ({ label: agent.name || agent.id, value: agent.id })),
+    [agents],
+  );
+  const agentNames = useMemo(
+    () => Object.fromEntries((agents ?? []).map((agent) => [agent.id, agent.name || agent.id])),
     [agents],
   );
 
@@ -257,7 +269,7 @@ export default function ScheduleDialog({
             {
               label: localize('com_ui_schedule_project_none'),
               value: '',
-              icon: <Folder className="h-4 w-4 text-text-secondary" aria-hidden="true" />,
+              icon: <Folder className="text-text-secondary h-4 w-4" aria-hidden="true" />,
             },
             ...loadedProjectItems,
           ],
@@ -317,25 +329,34 @@ export default function ScheduleDialog({
 
   const createSchedule = useCreateScheduleMutation({
     onSuccess: () => {
+      setMCPRecoveryOutcomes([]);
       createRequestId.current = v4();
       lastAttemptedPayload.current = null;
       showToast({ message: localize('com_ui_schedule_created'), status: 'success' });
       onOpenChange(false);
     },
-    onError: () => {
-      showToast({ message: localize('com_ui_error'), status: 'error' });
+    onError: (error) => {
+      setMCPRecoveryOutcomes(scheduleMCPErrorOutcomes(error));
+      showToast({
+        message: scheduleMCPErrorMessage(error, localize) ?? localize('com_ui_error'),
+        status: 'error',
+      });
     },
   });
 
   const updateSchedule = useUpdateScheduleMutation({
     onSuccess: () => {
+      setMCPRecoveryOutcomes([]);
       showToast({ message: localize('com_ui_schedule_updated'), status: 'success' });
       onOpenChange(false);
     },
     onError: (error) => {
+      setMCPRecoveryOutcomes(scheduleMCPErrorOutcomes(error));
       const status = (error as { response?: { status?: number } } | undefined)?.response?.status;
       showToast({
-        message: localize(status === 409 ? 'com_ui_schedule_conflict' : 'com_ui_error'),
+        message:
+          scheduleMCPErrorMessage(error, localize) ??
+          localize(status === 409 ? 'com_ui_schedule_conflict' : 'com_ui_error'),
         status: 'error',
       });
     },
@@ -530,7 +551,7 @@ export default function ScheduleDialog({
   const timezoneField = (
     <fieldset className="space-y-2">
       <legend>
-        <Label id="schedule-timezone-label" className="text-sm font-medium text-text-primary">
+        <Label id="schedule-timezone-label" className="text-sm font-medium">
           {localize('com_ui_schedule_timezone')}
         </Label>
       </legend>
@@ -568,6 +589,15 @@ export default function ScheduleDialog({
         className="w-11/12 md:max-w-3xl"
         main={
           <form id={FORM_ID} onSubmit={handleSubmit(onSubmit)} className="space-y-4">
+            <ScheduleMCPRecovery
+              outcomes={mcpRecoveryOutcomes}
+              fallbackAgentId={schedule?.agent_id ?? selectedAgentId}
+              agentNames={agentNames}
+              onOpenAgent={(ownerId) => {
+                onOpenChange(false);
+                navigate(`/c/new?agent_id=${encodeURIComponent(ownerId)}`);
+              }}
+            />
             {/* Identity row: what the schedule is, who runs it, where its chats land.
                 Its caption is grouped with it rather than left to the form's own 4-unit
                 rhythm, which would spend more vertical budget on the gap than the
@@ -575,7 +605,7 @@ export default function ScheduleDialog({
             <div className="space-y-1.5">
               <div className="grid gap-4 md:grid-cols-3">
                 <div className="space-y-2">
-                  <Label htmlFor="schedule-name" className="text-sm font-medium text-text-primary">
+                  <Label htmlFor="schedule-name" className="text-sm font-medium">
                     {localize('com_ui_name')}
                   </Label>
                   <Input
@@ -589,7 +619,7 @@ export default function ScheduleDialog({
                   <FieldMessage id="schedule-name-message" message={errors.name?.message} />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="schedule-agent" className="text-sm font-medium text-text-primary">
+                  <Label htmlFor="schedule-agent" className="text-sm font-medium">
                     {localize('com_ui_agent')}
                   </Label>
                   <Controller
@@ -626,10 +656,7 @@ export default function ScheduleDialog({
                   <FieldMessage id="schedule-agent-message" message={errors.agent_id?.message} />
                 </div>
                 <div className="space-y-2">
-                  <Label
-                    htmlFor="schedule-project"
-                    className="text-sm font-medium text-text-primary"
-                  >
+                  <Label htmlFor="schedule-project" className="text-sm font-medium">
                     {localize('com_ui_project')}
                   </Label>
                   {pinnedProjectId != null ? (
@@ -639,7 +666,7 @@ export default function ScheduleDialog({
                     <div
                       id="schedule-project"
                       data-testid="schedule-project-pinned"
-                      className="flex h-10 w-full items-center gap-2 rounded-xl border border-border-light bg-surface-secondary px-3 text-sm text-text-secondary"
+                      className="border-border-light bg-surface-secondary text-text-secondary flex h-10 w-full items-center gap-2 rounded-xl border px-3 text-sm"
                     >
                       <Folder className="h-4 w-4 shrink-0" aria-hidden="true" />
                       <span className="truncate">{projectDisplayName(pinnedProjectId)}</span>
@@ -674,7 +701,7 @@ export default function ScheduleDialog({
                           onBlur={field.onBlur}
                           items={projectItems}
                           SelectIcon={
-                            <Folder className="h-4 w-4 text-text-secondary" aria-hidden="true" />
+                            <Folder className="text-text-secondary h-4 w-4" aria-hidden="true" />
                           }
                           ariaLabel={localize('com_ui_project')}
                           ariaInvalid={errors.chatProjectId != null}
@@ -710,7 +737,7 @@ export default function ScheduleDialog({
               </div>
               {/* Full width, not inside the agent cell: at a third of the dialog this
                 sentence wraps an extra line and makes the identity row needlessly tall. */}
-              <p className="text-xs text-text-secondary">
+              <p className="text-text-secondary text-xs">
                 {localize('com_ui_schedule_target_new_chat')}
               </p>
             </div>
@@ -745,10 +772,7 @@ export default function ScheduleDialog({
 
             <fieldset className="space-y-2">
               <legend>
-                <Label
-                  id="schedule-frequency-label"
-                  className="text-sm font-medium text-text-primary"
-                >
+                <Label id="schedule-frequency-label" className="text-sm font-medium">
                   {localize('com_ui_schedule_frequency')}
                 </Label>
               </legend>
@@ -773,7 +797,7 @@ export default function ScheduleDialog({
             {frequency === 'cron' ? (
               <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
-                  <Label htmlFor="schedule-cron" className="text-sm font-medium text-text-primary">
+                  <Label htmlFor="schedule-cron" className="text-sm font-medium">
                     {localize('com_ui_schedule_cron_expression')}
                   </Label>
                   <Input
@@ -796,7 +820,7 @@ export default function ScheduleDialog({
                     data-testid="schedule-cron-input"
                     {...register('expression')}
                   />
-                  <p id="schedule-cron-hint" className="text-xs text-text-secondary">
+                  <p id="schedule-cron-hint" className="text-text-secondary text-xs">
                     {localize('com_ui_schedule_cron_hint')}
                   </p>
                   <FieldMessage
@@ -817,10 +841,7 @@ export default function ScheduleDialog({
                 {frequency === 'weekly' && (
                   <fieldset className="space-y-2">
                     <legend>
-                      <Label
-                        id="schedule-days-label"
-                        className="text-sm font-medium text-text-primary"
-                      >
+                      <Label id="schedule-days-label" className="text-sm font-medium">
                         {localize('com_ui_schedule_days')}
                       </Label>
                     </legend>
@@ -875,10 +896,7 @@ export default function ScheduleDialog({
                 )}
                 <fieldset className="space-y-2">
                   <legend>
-                    <Label
-                      id="schedule-time-label"
-                      className="text-sm font-medium text-text-primary"
-                    >
+                    <Label id="schedule-time-label" className="text-sm font-medium">
                       {localize(
                         frequency === 'hourly'
                           ? 'com_ui_schedule_minutes_past_hour'
@@ -929,7 +947,7 @@ export default function ScheduleDialog({
                   contradict the "pick at least one day" message right below it. */}
               {daysAreValid && (
                 <p
-                  className="break-words rounded-lg bg-surface-secondary px-3 py-2 text-sm text-text-secondary"
+                  className="bg-surface-secondary text-text-secondary rounded-lg px-3 py-2 text-sm break-words"
                   data-testid="schedule-summary"
                 >
                   {summary}
@@ -938,10 +956,10 @@ export default function ScheduleDialog({
               <FieldMessage id="schedule-cadence-message" message={cadenceError ?? undefined} />
               {previewRuns.length > 0 && (
                 <div className="space-y-1" data-testid="schedule-preview">
-                  <p className="text-xs font-medium text-text-primary">
+                  <p className="text-text-primary text-xs font-medium">
                     {localize('com_ui_schedule_next_runs')}
                   </p>
-                  <ul className="space-y-0.5 text-xs text-text-secondary">
+                  <ul className="text-text-secondary space-y-0.5 text-xs">
                     {previewRuns.map((run) => (
                       <li key={run.getTime()}>
                         {formatRunInstant(run, timezone, locale, prefersMeridiem)}

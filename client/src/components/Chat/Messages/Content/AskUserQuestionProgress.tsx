@@ -1,9 +1,13 @@
 import { useContext } from 'react';
 import { MessageCircleQuestion } from 'lucide-react';
-import parseJsonField, { parseJsonFieldOccurrences } from './Parts/parseJsonField';
-import { collectLiveAskToolCallIds } from '~/utils/approval';
-import { useGetMessagesByConvoId } from '~/data-provider';
+import { useToolPreparation } from '@librechat/chat/components';
+import {
+  parseJsonField,
+  parseJsonFieldOccurrences,
+  collectLiveAskToolCallIds,
+} from '@librechat/chat';
 import { ChatContext } from '~/Providers/ChatContext';
+import { useCachedMessages } from '~/data-provider';
 import { useLocalize } from '~/hooks';
 
 /**
@@ -28,12 +32,13 @@ export default function AskUserQuestionProgress({
   toolCallId?: string;
 }) {
   const localize = useLocalize();
+  const preparationText = useToolPreparation();
   const conversationId = useContext(ChatContext)?.conversation?.conversationId;
   const enabled = conversationId != null && conversationId !== 'new';
-  const { data: livePauses } = useGetMessagesByConvoId(enabled ? conversationId : '', {
-    enabled,
-    select: collectLiveAskToolCallIds,
-  });
+  const { data: livePauses } = useCachedMessages(
+    enabled ? conversationId : '',
+    collectLiveAskToolCallIds,
+  );
   const legacyQuestion = parseJsonField(args, 'question');
   const batchQuestion = (() => {
     if (typeof args === 'string') {
@@ -68,18 +73,18 @@ export default function AskUserQuestionProgress({
   }
 
   return (
-    <div className="my-2 flex w-full flex-col gap-1.5 rounded-lg border border-border-light bg-surface-secondary p-3">
+    <div className="border-border-light bg-surface-secondary my-2 flex w-full flex-col gap-1.5 rounded-lg border p-3">
       <div
-        className="flex items-center gap-2 text-xs font-medium text-text-secondary"
+        className="text-text-secondary flex items-center gap-2 text-xs font-medium"
         role="status"
       >
         <MessageCircleQuestion className="h-4 w-4 animate-pulse" aria-hidden="true" />
-        <span className="shimmer">{localize('com_ui_asking')}</span>
+        <span className="shimmer">{preparationText ?? localize('com_ui_asking')}</span>
       </div>
       {question.length > 0 ? (
-        <p className="text-sm font-medium text-text-primary [overflow-wrap:anywhere]">{question}</p>
+        <p className="text-text-primary text-sm font-medium [overflow-wrap:anywhere]">{question}</p>
       ) : (
-        <div className="h-4 w-2/5 animate-pulse rounded bg-surface-tertiary" aria-hidden="true" />
+        <div className="bg-surface-tertiary h-4 w-2/5 animate-pulse rounded" aria-hidden="true" />
       )}
     </div>
   );

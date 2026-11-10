@@ -120,18 +120,21 @@ describe('resolveConfiguredTheme', () => {
     });
   });
 
-  it('drops a definition with an unknown token rather than applying it in part', () => {
-    /** A half-applied theme is a product with one wrong colour and no way to tell
-     *  that from a design decision. */
+  it('follows the validator on an unknown token, which it now warns about and never paints', () => {
+    /** The validator owns what a valid theme is. It used to reject a colour token it did
+     *  not know; it now reports one as a warning and keeps it away from the DOM, so a
+     *  theme written for a newer or older token list still renders the tokens it shares. */
     const unknownToken = {
       ...validTheme,
       modes: { light: { colors: { 'rgb-not-a-token': '0 0 0' } } },
     };
+    const onInvalid = jest.fn();
 
-    const { definition, source } = resolveConfiguredTheme(unknownToken, () => {});
+    const { definition, source } = resolveConfiguredTheme(unknownToken, onInvalid);
 
-    expect(definition).toBeUndefined();
-    expect(source).toBe('invalid');
+    expect(definition).toEqual(unknownToken);
+    expect(source).toBe('config');
+    expect(onInvalid).not.toHaveBeenCalled();
   });
 
   it("surfaces the validator's own errors rather than a summary", () => {

@@ -73,7 +73,11 @@ jest.mock('fs', () => {
 });
 
 const { processAgentFileUpload } = require('~/server/services/Files/process');
-const { UninspectableFileError } = require('@librechat/api');
+const {
+  UninspectableFileError,
+  SpreadsheetBusyError,
+  SpreadsheetLimitError,
+} = require('@librechat/api');
 
 // Import the router
 const router = require('~/server/routes/files/files');
@@ -98,7 +102,7 @@ describe('File Routes - Agent Files Endpoint', () => {
   let modelsToCleanup = [];
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryServer.create({ instance: { launchTimeout: 30_000 } });
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
 
@@ -137,13 +141,15 @@ describe('File Routes - Agent Files Endpoint', () => {
     });
 
     app.use('/files', router);
-  });
+  }, 60_000);
 
   afterAll(async () => {
     // Clean up all collections before disconnecting
-    const collections = mongoose.connection.collections;
-    for (const key in collections) {
-      await collections[key].deleteMany({});
+    if (mongoose.connection.readyState === 1) {
+      const collections = mongoose.connection.collections;
+      for (const key in collections) {
+        await collections[key].deleteMany({});
+      }
     }
 
     // Clear only the models we added
@@ -154,7 +160,7 @@ describe('File Routes - Agent Files Endpoint', () => {
     }
 
     await mongoose.disconnect();
-    await mongoServer.stop();
+    await mongoServer?.stop();
   });
 
   beforeEach(async () => {
@@ -427,7 +433,41 @@ describe('File Routes - Agent Files Endpoint', () => {
       return testApp;
     };
 
+    it.each([
+      [false, 'application/json'],
+      [true, 'text/event-stream'],
+    ])(
+      'rejects unsupported provider audio before persistence (legacy=%s, accept=%s)',
+      async (legacyFileUploadUX, accept) => {
+        const testApp = createAppWithUser(
+          otherUserId,
+          SystemRoles.USER,
+          {
+            fileConfig: {
+              endpoints: { MyGateway: { supportedMimeTypes: ['audio/.*'], legacyFileUploadUX } },
+            },
+          },
+          { originalname: 'clip.wma', mimetype: 'audio/wma' },
+        );
+        const response = await request(testApp).post('/files').set('Accept', accept).send({
+          endpoint: 'MyGateway',
+          file_id: uuidv4(),
+        });
+        expect(response.status).toBe(415);
+        expect(response.body.message).toBe('com_error_files_provider_audio_format');
+        expect(processAgentFileUpload).not.toHaveBeenCalled();
+        expect(fs.unlink).toHaveBeenCalledWith('/tmp/test.txt');
+      },
+    );
+
     it('inspects the canonical sanitized filename used by upload processing', async () => {
+      await createAgent({
+        id: agentCustomId,
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: authorId,
+      });
       const testApp = createAppWithUser(
         authorId,
         SystemRoles.USER,
@@ -461,6 +501,49 @@ describe('File Routes - Agent Files Endpoint', () => {
         field: 'name',
       });
       expect(processAgentFileUpload).not.toHaveBeenCalled();
+    });
+
+    it('denies an unauthorized caller before validating against the agent', async () => {
+      /* Size and content validation run under the target agent's provider policy, so
+       * reaching them first answers an unauthorized caller with that agent's
+       * configuration instead of a 403. */
+      await createAgent({
+        id: agentCustomId,
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: authorId,
+      });
+
+      const readFile = jest.spyOn(fs, 'readFile');
+      const testApp = createAppWithUser(
+        otherUserId,
+        SystemRoles.USER,
+        {
+          filters: {
+            files: {
+              pii: {
+                fields: ['content'],
+                uninspectable: 'block',
+              },
+            },
+          },
+        },
+        { mimetype: 'application/octet-stream', size: 15 * 1024 * 1024 + 1 },
+      );
+
+      const response = await request(testApp).post('/files').send({
+        endpoint: 'agents',
+        agent_id: agentCustomId,
+        tool_resource: 'context',
+        file_id: uuidv4(),
+      });
+
+      expect(response.status).toBe(403);
+      expect(response.body.error).toBe('Forbidden');
+      expect(readFile).not.toHaveBeenCalled();
+      expect(processAgentFileUpload).not.toHaveBeenCalled();
+      readFile.mockRestore();
     });
 
     it('should deny file upload to agent when user has no permission', async () => {
@@ -512,6 +595,13 @@ describe('File Routes - Agent Files Endpoint', () => {
     });
 
     it('inspects mislabeled text content before upload processing', async () => {
+      await createAgent({
+        id: agentCustomId,
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: authorId,
+      });
       const readFile = jest
         .spyOn(fs, 'readFile')
         .mockResolvedValueOnce(Buffer.from('Contains PRIVATE-1234'));
@@ -554,6 +644,13 @@ describe('File Routes - Agent Files Endpoint', () => {
     });
 
     it('blocks opaque file content before upload processing when configured fail-closed', async () => {
+      await createAgent({
+        id: agentCustomId,
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: authorId,
+      });
       const readFile = jest
         .spyOn(fs, 'readFile')
         .mockResolvedValueOnce(Buffer.from([0, 255, 0, 137, 80, 78, 71]));
@@ -709,6 +806,13 @@ describe('File Routes - Agent Files Endpoint', () => {
     });
 
     it('does not defer raw content fail-close when extracted text is also selected', async () => {
+      await createAgent({
+        id: agentCustomId,
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: authorId,
+      });
       const readFile = jest
         .spyOn(fs, 'readFile')
         .mockResolvedValueOnce(Buffer.from([0, 255, 0, 80, 68, 70]));
@@ -747,6 +851,13 @@ describe('File Routes - Agent Files Endpoint', () => {
     });
 
     it('does not defer extracted-text fail-close for non-context agent resources', async () => {
+      await createAgent({
+        id: agentCustomId,
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: authorId,
+      });
       const readFile = jest
         .spyOn(fs, 'readFile')
         .mockResolvedValueOnce(Buffer.from([0, 255, 0, 80, 68, 70]));
@@ -788,6 +899,13 @@ describe('File Routes - Agent Files Endpoint', () => {
       ['an unsupported binary', 'archive.bin', 'application/octet-stream'],
       ['audio handled as a transcript', 'recording.mp3', 'audio/mpeg'],
     ])('does not defer extracted-text fail-close for %s', async (_, originalname, mimetype) => {
+      await createAgent({
+        id: agentCustomId,
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: authorId,
+      });
       const readFile = jest
         .spyOn(fs, 'readFile')
         .mockResolvedValueOnce(Buffer.from([0, 255, 0, 80, 68, 70]));
@@ -860,6 +978,13 @@ describe('File Routes - Agent Files Endpoint', () => {
     });
 
     it('detects opaque content after a long printable file prefix', async () => {
+      await createAgent({
+        id: agentCustomId,
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: authorId,
+      });
       const readFile = jest
         .spyOn(fs, 'readFile')
         .mockResolvedValueOnce(Buffer.concat([Buffer.alloc(8192, 'a'), Buffer.from([0, 255])]));
@@ -1143,6 +1268,49 @@ describe('File Routes - Agent Files Endpoint', () => {
       expect(processAgentFileUpload).toHaveBeenCalled();
     });
 
+    it('returns a retryable 503 for spreadsheet admission pressure and cleans up the upload', async () => {
+      processAgentFileUpload.mockRejectedValueOnce(new SpreadsheetBusyError());
+      const testApp = createAppWithUser(otherUserId);
+      const response = await request(testApp).post('/files').send({
+        endpoint: 'agents',
+        file_id: uuidv4(),
+      });
+      expect(response.status).toBe(503);
+      expect(response.headers['retry-after']).toBe('1');
+      expect(response.body).toEqual({
+        error: 'SPREADSHEET_BUSY',
+        message: 'Spreadsheet processing is busy; retry later.',
+        retryable: true,
+        retry_after: 1,
+      });
+      expect(fs.unlink).toHaveBeenCalled();
+    });
+
+    it.each([
+      undefined,
+      {
+        filters: { files: { pii: { fields: ['name'] } } },
+      },
+    ])(
+      'returns a stable spreadsheet limit rejection and cleans up the upload, config=%p',
+      async (config) => {
+        processAgentFileUpload.mockRejectedValueOnce(new SpreadsheetLimitError());
+        const testApp = createAppWithUser(otherUserId, SystemRoles.USER, config);
+        const response = await request(testApp).post('/files').send({
+          endpoint: 'agents',
+          file_id: uuidv4(),
+        });
+        expect(response.status).toBe(413);
+        expect(response.body).toEqual({
+          error: 'SPREADSHEET_LIMIT',
+          message: 'Spreadsheet exceeds the safe processing limits.',
+          retryable: false,
+        });
+        expect(response.headers['retry-after']).toBeUndefined();
+        expect(fs.unlink).toHaveBeenCalled();
+      },
+    );
+
     it('uses a normalized upload error when file protection is active', async () => {
       const rawProviderDetail = 'PRIVATE-UPLOAD echoed in provider failure';
       const providerError = Object.assign(new Error(rawProviderDetail), {
@@ -1241,7 +1409,7 @@ describe('File Routes - Agent Files Endpoint', () => {
       expect(JSON.stringify(response.body)).not.toContain(rawProviderDetail);
     });
 
-    it('should allow file upload with agent_id but no tool_resource (message attachment)', async () => {
+    it('should deny a permanent agent upload with no tool_resource from a user without permission', async () => {
       // Create an agent owned by authorId
       await createAgent({
         id: agentCustomId,
@@ -1253,15 +1421,17 @@ describe('File Routes - Agent Files Endpoint', () => {
 
       const testApp = createAppWithUser(otherUserId);
 
+      /* Unified mode accepts an upload with no tool_resource and promotes it to a
+       * context resource, so the permission check has to apply here: otherwise any
+       * user could attach persistent context to an agent they cannot edit. */
       const response = await request(testApp).post('/files').send({
         endpoint: 'agents',
         agent_id: agentCustomId,
         file_id: uuidv4(),
-        // No tool_resource - permission check should not apply
       });
 
-      expect(response.status).toBe(200);
-      expect(processAgentFileUpload).toHaveBeenCalled();
+      expect(response.status).toBe(403);
+      expect(processAgentFileUpload).not.toHaveBeenCalled();
     });
 
     it('should allow message_file attachment to agent even without EDIT permission', async () => {

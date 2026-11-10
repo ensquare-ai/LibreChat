@@ -2,6 +2,7 @@ import type {
   IAgentEventActorContextMeta,
   ICompactionSemanticIndexProjection,
 } from '@librechat/data-schemas';
+import type { ScheduleMCPOutcome, ScheduledMCPIdentity } from 'librechat-data-provider';
 import type { Agents, UserSubmittedMessageFieldPath } from 'librechat-data-provider';
 import type { EventEmitter } from 'events';
 import type {
@@ -10,7 +11,9 @@ import type {
   AgentTriggerExpectedAction,
 } from '../agents/triggers/types';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
+import type { EarlyBufferOverflowState } from './earlyBufferRecovery';
 import type { ResolvedAskUserQuestion } from '../agents/hitl/resume';
+import type { AuthoredSkillBinding } from '~/agents/authored';
 import type { MCPRuntimeRequestBody } from '../mcp/types';
 import type { ServerSentEvent } from './events';
 
@@ -23,12 +26,16 @@ export interface GenerationJobMetadata {
   checkpointNamespace?: string;
   /** Immutable generation protocol. Missing on legacy records means v1. */
   generationProtocolVersion?: 1 | 2;
+  earlyBufferOverflow?: EarlyBufferOverflowState;
   /** User message data for rebuilding submission on reconnect */
   userMessage?: Agents.UserMessageMeta;
   /** Response message ID for tracking */
   responseMessageId?: string;
   /** Whether this generation replaces an existing assistant branch. */
   isRegenerate?: boolean;
+  /** Whether this generation is a manual context compaction; the abort paths
+   * read it to stamp the stopped row with the compaction's identity. */
+  compact?: boolean;
   /** Exact normalized MCP placeholder identity for this turn. Persisted so HITL
    * resume does not reconstruct a different parent or overridden conversation. */
   mcpRequestBody?: MCPRuntimeRequestBody;
@@ -50,6 +57,8 @@ export interface GenerationJobMetadata {
   agent_id?: string;
   /** Whether the originating turn was a temporary chat; a HITL resume keeps it so. */
   isTemporary?: boolean;
+  /** Original server-authenticated retention deadline, serialized across replicas. */
+  retentionExpiresAt?: string;
   /** Exact durable delivery whose accepted continuation created this generation. */
   agentEventDeliveryKey?: string;
   /** Original actor invocation when the current mailbox delivery is an internal completion. */
@@ -75,10 +84,14 @@ export interface GenerationJobMetadata {
   scheduledFor?: string;
   scheduleConfigRevision?: number;
   scheduleManual?: boolean;
+  /** Original schedule root for a legacy completion, never occurrence bookkeeping. */
+  scheduleMCPCompletion?: ScheduledMCPIdentity;
   /** Intended terminal classification retained when Mongo outcome persistence
    * fails. The scheduler reconciler consumes this evidence before clearing the job. */
   scheduleOutcome?: 'success' | 'error' | 'interrupted' | 'skipped_balance';
   scheduleOutcomeError?: string;
+  /** Safe invocation denial retained until schedule settlement, never tool arguments. */
+  scheduleMCPFailure?: ScheduleMCPOutcome;
   /** Prevent normal terminal cleanup until schedule reconciliation has consumed
    * the retained outcome evidence. */
   preserveForScheduleReconcile?: boolean;
@@ -88,6 +101,7 @@ export interface GenerationJobMetadata {
    * without them the rebuilt model would lose the discovered tool schemas.
    */
   discoveredTools?: string[];
+  authoredSkills?: AuthoredSkillBinding[];
   /** Bounded collector state for continuing a phase across HITL resume. */
   activityPhaseSnapshot?: ActivityPhaseSnapshot;
   /** Exact bounded compaction guidance captured atomically with a HITL pause. */
@@ -114,6 +128,7 @@ export interface GenerationJobMetadata {
   idempotencyClientRequestId?: string;
   /** Normal FINAL publication is waiting on required durable abort work. */
   terminalPersistencePending?: boolean;
+  terminalHostActionPending?: boolean;
   terminalPersistenceStartedAt?: number;
   /** Set when the job is paused for human review (status === 'requires_action') */
   pendingAction?: Agents.PendingAction;

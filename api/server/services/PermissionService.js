@@ -1,5 +1,5 @@
 const mongoose = require('mongoose');
-const { AccessControlService, isEnabled } = require('@librechat/api');
+const { AccessControlService, isEnabled, ensureDirectoryPrincipalUser } = require('@librechat/api');
 const {
   tenantStorage,
   getTenantId,
@@ -337,36 +337,20 @@ const ensurePrincipalExists = async function (principal) {
   }
 
   if (principal.type === PrincipalType.USER && principal.source === 'entra') {
-    if (!principal.email || !principal.idOnTheSource) {
-      throw new Error('Entra ID user principals must have email and idOnTheSource');
-    }
-
-    let existingUser = await db.findUser({ idOnTheSource: principal.idOnTheSource });
-
-    if (!existingUser) {
-      existingUser = await db.findUser({ email: principal.email });
-    }
-
-    if (existingUser) {
-      if (!existingUser.idOnTheSource && principal.idOnTheSource) {
-        await db.updateUser(existingUser._id, {
-          idOnTheSource: principal.idOnTheSource,
-          provider: 'openid',
-        });
-      }
-      return existingUser._id.toString();
-    }
-
-    const userData = {
-      name: principal.name,
-      email: principal.email.toLowerCase(),
-      emailVerified: false,
-      provider: 'openid',
-      idOnTheSource: principal.idOnTheSource,
-    };
-
-    const userId = await db.createUser(userData, true, true);
-    return userId.toString();
+    return ensureDirectoryPrincipalUser(principal, {
+      findUserBySourceId: async (idOnTheSource) => {
+        const user = await db.findUser({ idOnTheSource });
+        return user ? { id: user._id.toString() } : null;
+      },
+      findUserByEmail: async (email) => {
+        const user = await db.findUser({ email });
+        return user ? { id: user._id.toString() } : null;
+      },
+      createUser: async (userData) => {
+        const userId = await db.createUser(userData, true, true);
+        return userId.toString();
+      },
+    });
   }
 
   if (principal.type === PrincipalType.GROUP) {
@@ -711,9 +695,6 @@ const hasPublicPermission = async ({ resourceType, resourceId, requiredPermissio
 const accessControlService = new AccessControlService(mongoose, db);
 const bulkUpdateResourcePermissions = (params) =>
   accessControlService.bulkUpdateResourcePermissions(params);
-const restoreInsightsPermissionChanges = (params) =>
-  accessControlService.restoreInsightsPermissionChanges(params);
-
 /**
  * Remove all permissions for a resource (cleanup when resource is deleted)
  * @param {Object} params - Parameters for removing all permissions
@@ -755,7 +736,6 @@ module.exports = {
   hasPublicPermission,
   getAvailableRoles,
   bulkUpdateResourcePermissions,
-  restoreInsightsPermissionChanges,
   ensurePrincipalExists,
   ensureGroupPrincipalExists,
   syncUserEntraGroupMemberships,
