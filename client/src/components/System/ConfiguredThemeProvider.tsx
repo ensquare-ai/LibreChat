@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useState, useSyncExternalStore } from 'react';
 import { QueryKeys } from 'librechat-data-provider';
 import { notifyManager, useQueryClient } from '@tanstack/react-query';
 import { ThemeProvider, useTheme, validateThemeDefinition } from '@librechat/client';
@@ -139,6 +139,25 @@ function useRebindOnStartupConfigRebuild() {
 }
 
 /**
+ * The startup config, held over the moments it is being fetched again.
+ *
+ * Signing in empties the query cache as the token refresh does, but on a screen the
+ * visitor is looking at: for as long as the new config takes to arrive there is none,
+ * and a loader that believed that would take the theme off the sign-in screen just as
+ * the visitor leaves it. So the last config seen stands in until the next one is here.
+ * It is replaced by whatever arrives, a config without a theme included, so a theme
+ * taken out of the deployment still goes the moment the configuration says so.
+ */
+function useHeldStartupConfig() {
+  const { data } = useGetStartupConfig();
+  const [held, setHeld] = useState(data);
+  if (data !== undefined && data !== held) {
+    setHeld(data);
+  }
+  return data ?? held;
+}
+
+/**
  * Clears a theme the provider restored from the browser's storage when this page is
  * not meant to carry one.
  *
@@ -199,7 +218,7 @@ export default function ConfiguredThemeProvider({
   router?: LocationSource;
 }) {
   useRebindOnStartupConfigRebuild();
-  const { data: startupConfig } = useGetStartupConfig();
+  const startupConfig = useHeldStartupConfig();
   const envTheme: IThemeRGB | undefined = getThemeFromEnv();
   const pathname = useRouterPathname(router);
 
