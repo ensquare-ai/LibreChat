@@ -1,4 +1,6 @@
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useMemo, useReducer, useSyncExternalStore } from 'react';
+import { QueryKeys } from 'librechat-data-provider';
+import { notifyManager, useQueryClient } from '@tanstack/react-query';
 import { ThemeProvider, useTheme, validateThemeDefinition } from '@librechat/client';
 import type { ThemeDefinition, IThemeRGB } from '@librechat/client';
 import type { ThemeScope } from 'librechat-data-provider';
@@ -109,6 +111,34 @@ function useRouterPathname(router: LocationSource): string {
 }
 
 /**
+ * Reads the startup config again whenever its query is rebuilt.
+ *
+ * The auth mutations empty the query cache — the silent token refresh does it on every
+ * page load, before a visitor has typed anything — and that detaches an observer as
+ * long-lived as this one from the query it was reading. Nothing above the loader
+ * re-renders it, so without this it would go on holding no configuration at all and the
+ * sign-in screen would render the bundled default for good. Upstream's
+ * `DeploymentTheme` meets the same thing the same way; the cache event fires for every
+ * query in the app, so it is matched by key alone and batched past the render that
+ * caused it.
+ */
+function useRebindOnStartupConfigRebuild() {
+  const queryClient = useQueryClient();
+  const [, rebind] = useReducer((count: number) => count + 1, 0);
+  useEffect(
+    () =>
+      queryClient.getQueryCache().subscribe(
+        notifyManager.batchCalls((event) => {
+          if (event.type === 'added' && event.query.queryKey[0] === QueryKeys.startupConfig) {
+            rebind();
+          }
+        }),
+      ),
+    [queryClient],
+  );
+}
+
+/**
  * Clears a theme the provider restored from the browser's storage when this page is
  * not meant to carry one.
  *
@@ -168,6 +198,7 @@ export default function ConfiguredThemeProvider({
   children: ReactNode;
   router?: LocationSource;
 }) {
+  useRebindOnStartupConfigRebuild();
   const { data: startupConfig } = useGetStartupConfig();
   const envTheme: IThemeRGB | undefined = getThemeFromEnv();
   const pathname = useRouterPathname(router);

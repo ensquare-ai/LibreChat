@@ -1,5 +1,7 @@
 import { ThemeContext } from '@librechat/client';
+import { QueryKeys } from 'librechat-data-provider';
 import { act, render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { IThemeRGB, ThemeDefinition } from '@librechat/client';
 import type { ContextType } from 'react';
 import type { LocationSource } from './ConfiguredThemeProvider';
@@ -72,11 +74,13 @@ function fakeRouter(pathname: string) {
   return router;
 }
 
-function renderProvider(router?: LocationSource) {
+function renderProvider(router?: LocationSource, queryClient = new QueryClient()) {
   return render(
-    <ConfiguredThemeProvider router={router}>
-      <span>{'child'}</span>
-    </ConfiguredThemeProvider>,
+    <QueryClientProvider client={queryClient}>
+      <ConfiguredThemeProvider router={router}>
+        <span>{'child'}</span>
+      </ConfiguredThemeProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -287,6 +291,37 @@ describe('ConfiguredThemeProvider', () => {
       expect(props.themeDefinition).toBeUndefined();
       expect(props.themeRGB).toBeUndefined();
     });
+  });
+
+  it('reads the configuration again when its query is rebuilt under it', async () => {
+    const queryClient = new QueryClient();
+    renderProvider(fakeRouter('/login'), queryClient);
+    expect(lastProviderProps().themeDefinition).toBeUndefined();
+
+    /** What a page load does: the token refresh empties the cache, then the config is fetched anew. */
+    mockUseGetStartupConfig.mockReturnValue({ data: { theme: loginTheme } });
+    act(() => {
+      queryClient.removeQueries();
+      queryClient.setQueryData([QueryKeys.startupConfig, 'anonymous'], { theme: loginTheme });
+    });
+
+    await waitFor(() => expect(lastProviderProps().themeDefinition).toEqual(validTheme));
+    expect(document.documentElement.dataset.themeSource).toBe('config');
+  });
+
+  it('does not re-render for queries that are not the configuration', async () => {
+    const queryClient = new QueryClient();
+    renderProvider(undefined, queryClient);
+    const renders = mockUseGetStartupConfig.mock.calls.length;
+
+    act(() => {
+      queryClient.setQueryData([QueryKeys.user], { id: 'someone' });
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(mockUseGetStartupConfig.mock.calls.length).toBe(renders);
   });
 
   it('renders an unscoped theme everywhere, whatever the route', () => {
