@@ -309,6 +309,43 @@ describe('ConfiguredThemeProvider', () => {
     expect(document.documentElement.dataset.themeSource).toBe('config');
   });
 
+  it('keeps the theme on screen while the configuration is fetched again', async () => {
+    mockUseGetStartupConfig.mockReturnValue({ data: { theme: loginTheme } });
+    const queryClient = new QueryClient();
+    renderProvider(fakeRouter('/login'), queryClient);
+    expect(lastProviderProps().themeDefinition).toEqual(validTheme);
+
+    /** What signing in does: the cache is emptied and the config is not back yet. */
+    mockUseGetStartupConfig.mockReturnValue({ data: undefined });
+    mockThemeProviderProps.mockClear();
+    act(() => {
+      queryClient.removeQueries();
+      queryClient.getQueryCache().build(queryClient, { queryKey: [QueryKeys.startupConfig] });
+    });
+
+    /** The loader did look again, and found nothing: the theme has to survive that. */
+    await waitFor(() => expect(mockThemeProviderProps).toHaveBeenCalled());
+    for (const [props] of mockThemeProviderProps.mock.calls) {
+      expect(props.themeDefinition).toEqual(validTheme);
+    }
+    expect(document.documentElement.dataset.themeSource).toBe('config');
+  });
+
+  it('lets go of a held theme when the configuration comes back without one', async () => {
+    mockUseGetStartupConfig.mockReturnValue({ data: { theme: loginTheme } });
+    const queryClient = new QueryClient();
+    renderProvider(fakeRouter('/login'), queryClient);
+
+    mockUseGetStartupConfig.mockReturnValue({ data: {} });
+    act(() => {
+      queryClient.removeQueries();
+      queryClient.setQueryData([QueryKeys.startupConfig, 'anonymous'], {});
+    });
+
+    await waitFor(() => expect(lastProviderProps().themeDefinition).toBeUndefined());
+    expect(document.documentElement.dataset.themeSource).toBe('default');
+  });
+
   it('does not re-render for queries that are not the configuration', async () => {
     const queryClient = new QueryClient();
     renderProvider(undefined, queryClient);
