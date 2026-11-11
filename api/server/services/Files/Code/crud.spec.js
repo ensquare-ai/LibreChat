@@ -17,6 +17,8 @@ jest.mock('@librechat/agents', () => ({
  * and has its own dedicated `identity.spec.ts` covering the validation
  * matrix; this stub just mirrors enough behavior for the surrounding
  * crud tests to exercise the upload/download flow. */
+jest.mock('~/models', () => ({ clearFileCodeEnvRefs: jest.fn().mockResolvedValue(true) }));
+
 const VALID_KINDS = new Set(['skill', 'agent', 'user']);
 const validateIdentity = ({ kind, id, version }, label) => {
   if (!kind || !VALID_KINDS.has(kind)) throw new Error(`${label}: invalid kind "${kind}"`);
@@ -33,6 +35,8 @@ jest.mock('@librechat/api', () => {
   const http = require('http');
   const https = require('https');
   return {
+    ...jest.requireActual('../../../../../packages/api/src/files/code/delete'),
+    ...jest.requireActual('../../../../../packages/api/src/files/dispatch'),
     appendCodeEnvFile: jest.fn((form, stream, filename) => {
       form.append('file', stream, { filename });
     }),
@@ -41,6 +45,14 @@ jest.mock('@librechat/api', () => {
       form.append('kind', identity.kind);
       form.append('id', identity.id);
       if (identity.version != null) form.append('version', String(identity.version));
+    }),
+    wrapCodeApiUploadError: jest.fn((error, message) => {
+      const wrapped = new Error(`${message} ${error.message}`, { cause: error });
+      if (error?.isAxiosError === true) {
+        wrapped.isAxiosError = true;
+        wrapped.response = error.response;
+      }
+      return wrapped;
     }),
     buildCodeEnvDownloadQuery: jest.fn((identity) => {
       validateIdentity(identity, 'buildCodeEnvDownloadQuery');
@@ -81,6 +93,42 @@ describe('Code CRUD', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     getCodeApiAuthHeaders.mockResolvedValue({});
+  });
+
+  it('marks upload dispatch after authentication and before a lost HTTP response', async () => {
+    const onUploadStart = jest.fn();
+    mockAxios.post.mockImplementationOnce(async () => {
+      expect(onUploadStart).toHaveBeenCalledTimes(1);
+      throw new Error('transport response lost');
+    });
+    await expect(
+      uploadCodeEnvFile({
+        req: { user: { id: 'user-123' } },
+        stream: Readable.from('data'),
+        filename: 'data.csv',
+        kind: 'user',
+        id: 'user-123',
+        onUploadStart,
+      }),
+    ).rejects.toThrow('transport response lost');
+    expect(onUploadStart).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not mark remote dispatch when upload authentication fails locally', async () => {
+    const onUploadStart = jest.fn();
+    getCodeApiAuthHeaders.mockRejectedValueOnce(new Error('credential lookup unavailable'));
+    await expect(
+      uploadCodeEnvFile({
+        req: { user: { id: 'user-123' } },
+        stream: Readable.from('data'),
+        filename: 'data.csv',
+        kind: 'user',
+        id: 'user-123',
+        onUploadStart,
+      }),
+    ).rejects.toThrow('credential lookup unavailable');
+    expect(onUploadStart).not.toHaveBeenCalled();
+    expect(mockAxios.post).not.toHaveBeenCalled();
   });
 
   describe('getCodeOutputDownloadStream', () => {
@@ -354,8 +402,35 @@ describe('Code CRUD', () => {
         Object.assign(new Error('missing'), { response: { status: 404 } }),
       );
 
-      await expect(deleteCodeEnvFile(req, file)).resolves.toBeUndefined();
+      await expect(deleteCodeEnvFile(req, file)).resolves.toEqual({ deleted: true });
       expect(mockAxios).toHaveBeenCalledTimes(1);
+    });
+
+    it('treats objects on a profile the deployment no longer serves as unreachable', async () => {
+      mockAxios.mockRejectedValue(
+        Object.assign(new Error('Request failed with status code 409'), {
+          response: {
+            status: 409,
+            data: {
+              error: 'execution_profile_mismatch',
+              expected_profile: 'default',
+              actual_profile: 'stateful',
+            },
+          },
+        }),
+      );
+
+      await expect(deleteCodeEnvFile(req, file)).resolves.toBeUndefined();
+    });
+
+    it('throws on other conflicts', async () => {
+      mockAxios.mockRejectedValue(
+        Object.assign(new Error('conflict'), {
+          response: { status: 409, data: { error: 'session_busy' } },
+        }),
+      );
+
+      await expect(deleteCodeEnvFile(req, file)).rejects.toThrow('conflict');
     });
 
     it('throws when code environment deletion fails', async () => {
@@ -421,7 +496,11 @@ describe('Code CRUD', () => {
       });
 
       const result = await uploadCodeEnvFile(baseUploadParams);
-      expect(result).toEqual({ storage_session_id: 'sess-1', file_id: 'fid-1' });
+      expect(result).toEqual({
+        storage_session_id: 'sess-1',
+        file_id: 'fid-1',
+        filename: 'data.csv',
+      });
     });
 
     it('forwards Code API auth headers on upload requests', async () => {
@@ -561,10 +640,25 @@ describe('Code CRUD', () => {
 
       await expect(uploadCodeEnvFile(baseUploadParams)).rejects.toThrow();
     });
+
+    it('preserves rate-limit metadata through the upload logging boundary', async () => {
+      const rateLimit = Object.assign(new Error('Too Many Requests'), {
+        isAxiosError: true,
+        response: { status: 429, headers: { 'retry-after': '7' } },
+      });
+      mockAxios.post.mockRejectedValue(rateLimit);
+
+      await expect(uploadCodeEnvFile(baseUploadParams)).rejects.toMatchObject({
+        isAxiosError: true,
+        response: { status: 429, headers: { 'retry-after': '7' } },
+        cause: rateLimit,
+      });
+    });
   });
 
   describe('batchUploadCodeEnvFiles', () => {
     it('routes batch uploads through the selected bridge worker', async () => {
+      const controller = new AbortController();
       const req = { user: { id: 'user-123' } };
       mockAxios.post.mockResolvedValue({
         data: {
@@ -584,6 +678,7 @@ describe('Code CRUD', () => {
         codeApiBaseUrl: 'https://stateful-code.example.com',
         executionProfile: 'stateful',
         bridgeWorkerId: 'personal-worker-1',
+        signal: controller.signal,
       });
 
       const [url, , callConfig] = mockAxios.post.mock.calls[0];
@@ -591,6 +686,7 @@ describe('Code CRUD', () => {
       expect(getCodeApiAuthHeaders).toHaveBeenCalledWith(req, 'personal-worker-1');
       expect(callConfig.headers['X-CodeAPI-Expected-Profile']).toBe('stateful');
       expect(callConfig.headers['X-LibreChat-Code-Worker-ID']).toBe('personal-worker-1');
+      expect(callConfig.signal).toBe(controller.signal);
     });
   });
 });

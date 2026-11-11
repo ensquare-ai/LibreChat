@@ -1,7 +1,9 @@
+import { MAX_FILE_TEXT_PREVIEW_LENGTH } from 'librechat-data-provider';
 import type { IMongoFile } from '@librechat/data-schemas';
 import type { SteerFileFetcher } from '../request';
 import type { SteerMediaClient } from '../media';
 import { buildSteerMedia, collectSteerStampTargets, stampSteerPartMedia } from '../media';
+import { AttachmentObjectNotFoundError } from '~/files/encode/utils';
 
 jest.spyOn(console, 'log').mockImplementation();
 
@@ -15,8 +17,9 @@ function createClient({
   image_urls?: Array<Record<string, unknown>>;
   documents?: Array<Record<string, unknown>>;
   fileContext?: string;
-} = {}): SteerMediaClient & { processAttachments: jest.Mock } {
+} = {}): SteerMediaClient & { processAttachments: jest.Mock; resolveTurnAttachments: jest.Mock } {
   return {
+    resolveTurnAttachments: jest.fn((files: IMongoFile[]) => files),
     addFileContextToMessage: jest.fn(async (pseudo: Record<string, unknown>) => {
       if (fileContext) {
         pseudo.fileContext = fileContext;
@@ -103,10 +106,11 @@ describe('buildSteerMedia', () => {
       getFiles,
     });
 
-    expect(client.processAttachments).toHaveBeenCalledWith(expect.anything(), [
-      secondDoc,
-      imageDoc,
-    ]);
+    expect(client.processAttachments).toHaveBeenCalledWith(
+      expect.anything(),
+      [secondDoc, imageDoc],
+      { executeCode: false, fileSearch: false },
+    );
     expect(result?.files?.map((file) => file.file_id)).toEqual(['f2', 'f1']);
   });
 
@@ -133,6 +137,39 @@ describe('buildSteerMedia', () => {
     expect(client.processAttachments).not.toHaveBeenCalled();
   });
 
+  it('checks and encodes the turn view of the records it loads', async () => {
+    /* A tool-routed file this turn delivers as text is stored as `none`: the preflight and the
+     * encoders must both see the turn's copy, or the text would skip the model-bound checks. */
+    const storedCsv = { file_id: 'csv', type: 'text/csv', llmDeliveryPath: 'none' };
+    const turnCsv = { ...storedCsv, llmDeliveryPath: 'text' };
+    const getFiles: SteerFileFetcher = jest.fn(async () => [storedCsv as unknown as IMongoFile]);
+    const client = createClient();
+    client.resolveTurnAttachments.mockReturnValueOnce([turnCsv]);
+    const assertFilesAllowed = jest.fn();
+
+    await buildSteerMedia({
+      client,
+      user,
+      item: steerItem([{ file_id: 'csv' }]),
+      getFiles,
+      assertFilesAllowed,
+    });
+
+    expect(client.resolveTurnAttachments).toHaveBeenCalledWith([storedCsv], {
+      executeCode: false,
+      fileSearch: false,
+    });
+    expect(assertFilesAllowed).toHaveBeenCalledWith([turnCsv]);
+    expect(client.addFileContextToMessage).toHaveBeenCalledWith(expect.anything(), [turnCsv], {
+      executeCode: false,
+      fileSearch: false,
+    });
+    expect(client.processAttachments).toHaveBeenCalledWith(expect.anything(), [turnCsv], {
+      executeCode: false,
+      fileSearch: false,
+    });
+  });
+
   it('prepends extracted file context to the steer text', async () => {
     const getFiles: SteerFileFetcher = jest.fn(async () => [
       { file_id: 'f2', type: 'text/plain' } as unknown as IMongoFile,
@@ -149,6 +186,31 @@ describe('buildSteerMedia', () => {
     expect(result?.content).toEqual([
       { type: 'text', text: 'Attached document(s): notes\nsummarize it' },
     ]);
+  });
+
+  it('derives display previews from trusted text without truncating the model input', async () => {
+    const text = ` \n${'full stored paste '.repeat(30)}`;
+    const doc = { ...imageDoc, type: 'text/plain', text, textPreview: 'stale preview' };
+    const getFiles: SteerFileFetcher = jest.fn(async () => [doc]);
+    const client = createClient({ fileContext: text });
+    const item = {
+      ...steerItem([{ file_id: 'f1' }]),
+      files: [{ file_id: 'f1', textPreview: 'malicious preview' }],
+    };
+    const result = await buildSteerMedia({ client, user, item, getFiles });
+
+    expect(result?.files?.[0].textPreview).toBe(text.slice(0, MAX_FILE_TEXT_PREVIEW_LENGTH));
+    expect(result?.files?.[0]).not.toHaveProperty('text');
+    expect(client.addFileContextToMessage).toHaveBeenCalledWith(expect.anything(), [doc], {
+      executeCode: false,
+      fileSearch: false,
+    });
+    expect(client.processAttachments).toHaveBeenCalledWith(expect.anything(), [doc], {
+      executeCode: false,
+      fileSearch: false,
+    });
+    expect(result?.content).toEqual([{ type: 'text', text: `${text}\nlook at this` }]);
+    expect(doc.text).toBe(text);
   });
 
   it('returns undefined when no authorized files remain', async () => {
@@ -238,6 +300,25 @@ describe('stampSteerPartMedia', () => {
     ]);
   });
 
+  it('encodes the turn view of the records it fetches itself', async () => {
+    const storedCsv = { file_id: 'csv', type: 'text/csv', llmDeliveryPath: 'none' };
+    const turnCsv = { ...storedCsv, llmDeliveryPath: 'text' };
+    const getFiles: SteerFileFetcher = jest.fn(async () => [storedCsv as unknown as IMongoFile]);
+    const client = createClient();
+    client.resolveTurnAttachments.mockReturnValueOnce([turnCsv]);
+    const message = {
+      role: 'assistant',
+      content: [
+        { type: 'steer', steer: 'use the sheet', steerId: 's3', files: [{ file_id: 'csv' }] },
+      ],
+    };
+
+    await stampSteerPartMedia({ client, user, payload: [message], getFiles });
+
+    expect(client.resolveTurnAttachments).toHaveBeenCalledWith([storedCsv]);
+    expect(client.processAttachments).toHaveBeenCalledWith(expect.anything(), [turnCsv], undefined);
+  });
+
   it('consumes prefetched docs without issuing a second query', async () => {
     const getFiles: SteerFileFetcher = jest.fn(async () => []);
     const client = createClient({ image_urls: [imagePart] });
@@ -260,7 +341,11 @@ describe('stampSteerPartMedia', () => {
     expect(getFiles).not.toHaveBeenCalled();
     expect(stamped).toHaveLength(1);
     expect(stamped[0].index).toBe(0);
-    expect(client.processAttachments).toHaveBeenCalledWith(expect.anything(), [imageDoc]);
+    expect(client.processAttachments).toHaveBeenCalledWith(
+      expect.anything(),
+      [imageDoc],
+      undefined,
+    );
   });
 
   it('does nothing when no steer part carries files', async () => {
@@ -283,6 +368,35 @@ describe('stampSteerPartMedia', () => {
     await stampSteerPartMedia({ client: createClient(), user, payload: [message], getFiles });
 
     expect((message.content as unknown[])[0]).toBe(steerPart);
+    expect(steerPart).not.toHaveProperty('media');
+  });
+
+  it('propagates a missing attachment object instead of replaying text only', async () => {
+    const getFiles: SteerFileFetcher = jest.fn(async () => []);
+    const client = createClient();
+    client.processAttachments = jest
+      .fn()
+      .mockRejectedValue(new AttachmentObjectNotFoundError('missing-object'));
+    const steerPart = {
+      type: 'steer',
+      steer: 'read the missing file',
+      steerId: 'missing-steer',
+      files: [{ file_id: 'missing-object' }],
+    };
+    const message = { role: 'assistant', content: [steerPart] };
+
+    await expect(
+      stampSteerPartMedia({
+        client,
+        user,
+        payload: [message],
+        docsById: new Map([['missing-object', imageDoc]]),
+        getFiles,
+      }),
+    ).rejects.toMatchObject({
+      code: 'ATTACHMENT_OBJECT_NOT_FOUND',
+      fileId: 'missing-object',
+    });
     expect(steerPart).not.toHaveProperty('media');
   });
 

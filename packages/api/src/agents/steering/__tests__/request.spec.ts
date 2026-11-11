@@ -1,11 +1,13 @@
+import { MAX_FILE_TEXT_PREVIEW_LENGTH } from 'librechat-data-provider';
 import type { IMongoFile } from '@librechat/data-schemas';
 import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
-import { buildPendingAction, buildToolApprovalPayload } from '~/agents/hitl/policy';
 import { handleSteerRequest, handleSteerCancel, handleSteerArm } from '../request';
+import { buildToolApprovalPayload } from '~/agents/hitl/__fixtures__/approval';
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
 import { isSteeringSupported, isSteerPreemptSupported } from '../runtime';
 import { STEER_QUEUE_MAX_DEPTH } from '~/stream/interfaces/IJobStore';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
+import { buildPendingAction } from '~/agents/hitl/policy';
 
 jest.mock('../runtime', () => ({
   ...jest.requireActual('../runtime'),
@@ -264,6 +266,7 @@ describe('handleSteerRequest (real in-memory job manager)', () => {
           height: 10,
           width: 20,
           bytes: 999,
+          llmDeliveryPath: 'text',
           user: 'someone-else',
           embedded: true,
         },
@@ -292,6 +295,7 @@ describe('handleSteerRequest (real in-memory job manager)', () => {
         height: 10,
         width: 20,
         bytes: 999,
+        llmDeliveryPath: 'text',
       },
     ]);
   });
@@ -388,6 +392,7 @@ describe('handleSteerRequest (real in-memory job manager)', () => {
       height: 4,
       width: 6,
       bytes: 111,
+      llmDeliveryPath: 'text',
       user: 'user-1',
     } as unknown as IMongoFile;
 
@@ -450,8 +455,62 @@ describe('handleSteerRequest (real in-memory job manager)', () => {
           height: 4,
           width: 6,
           bytes: 111,
+          llmDeliveryPath: 'text',
         },
       ]);
+    });
+
+    it('replaces malicious client previews with bounded owner-scoped full-text previews', async () => {
+      const streamId = 'steer-req-trusted-preview';
+      const tenantUser = { ...user, tenantId: 'tenant-1' };
+      await GenerationJobManager.createJob(streamId, user.id, undefined, {
+        initialMetadata: { generationProtocolVersion: 2, tenantId: tenantUser.tenantId },
+      });
+      const text = ` \n${'trusted stored text '.repeat(30)}`;
+      const getFiles = jest.fn(async () => [
+        {
+          ...dbDoc,
+          type: 'text/plain',
+          text,
+          tenantId: tenantUser.tenantId,
+          textPreview: 'stale stored preview',
+        },
+      ]);
+      const result = await handleSteerRequest(
+        tenantUser,
+        {
+          conversationId: streamId,
+          clientSteerId: 'client-trusted-preview',
+          text: 'use the paste',
+          files: [{ file_id: 'f1', text: 'malicious full text', textPreview: 'malicious preview' }],
+        },
+        { getFiles, generationProtocolVersion: 2 },
+      );
+
+      expect(result.status).toBe(202);
+      expect(getFiles).toHaveBeenCalledWith(
+        {
+          file_id: { $in: ['f1'] },
+          user: user.id,
+          tenantId: tenantUser.tenantId,
+        },
+        {},
+        {},
+      );
+      const queued = await GenerationJobManager.steering.peek(streamId);
+      const expected = {
+        ...dbDoc,
+        type: 'text/plain',
+        textPreview: text.slice(0, MAX_FILE_TEXT_PREVIEW_LENGTH),
+      };
+      const { user: _owner, ...expectedRef } = expected;
+      expect(queued[0].files).toEqual([expectedRef]);
+      const receipt = await GenerationJobManager.steering.getReceipt(
+        streamId,
+        'client-trusted-preview',
+      );
+      expect(receipt?.item.files).toEqual([expectedRef]);
+      expect(queued[0].files?.[0]).not.toHaveProperty('text');
     });
 
     it('skips the resolve for text-only steers', async () => {
@@ -914,6 +973,62 @@ describe('generation protocol bridge for steering mutations', () => {
     expect(quoted?.fingerprint).toBe(plain?.fingerprint);
     expect(typeof quoted?.requestedQuotesFingerprint).toBe('string');
     expect(plain?.requestedQuotesFingerprint).toBeUndefined();
+  });
+
+  it('keeps receipt fingerprints stable when delivery metadata and previews change', async () => {
+    const streamId = 'steer-protocol-v2-delivery-path-fingerprint';
+    await GenerationJobManager.createJob(streamId, user.id, undefined, {
+      initialMetadata: { generationProtocolVersion: 2 },
+    });
+    const base = {
+      conversationId: streamId,
+      text: 'same attachment steer',
+      files: [{ file_id: 'f1', type: 'application/pdf', filename: 'report.pdf' }],
+    };
+
+    await handleSteerRequest(
+      user,
+      { ...base, clientSteerId: 'client-legacy-file-ref' },
+      {
+        generationProtocolVersion: 2,
+      },
+    );
+    await handleSteerRequest(
+      user,
+      {
+        ...base,
+        clientSteerId: 'client-current-file-ref',
+        files: [{ ...base.files[0], llmDeliveryPath: 'text', textPreview: 'original snippet' }],
+      },
+      { generationProtocolVersion: 2 },
+    );
+
+    const legacy = await GenerationJobManager.steering.getReceipt(
+      streamId,
+      'client-legacy-file-ref',
+    );
+    const current = await GenerationJobManager.steering.getReceipt(
+      streamId,
+      'client-current-file-ref',
+    );
+    expect(current?.fingerprint).toBe(legacy?.fingerprint);
+    expect(current?.item.files?.[0].textPreview).toBe('original snippet');
+    for (const [clientSteerId, files] of [
+      [
+        'client-legacy-file-ref',
+        [{ ...base.files[0], llmDeliveryPath: 'text', textPreview: 'new preview' }],
+      ],
+      ['client-current-file-ref', [{ ...base.files[0], textPreview: 'changed preview' }]],
+      ['client-current-file-ref', base.files],
+    ] as const) {
+      const replay = await handleSteerRequest(
+        user,
+        { ...base, clientSteerId, files },
+        { generationProtocolVersion: 2 },
+      );
+      expect(replay.body).toMatchObject({ replayed: true });
+    }
+    expect(await GenerationJobManager.steering.peek(streamId)).toHaveLength(2);
   });
 
   it('treats quotes as part of the idempotency identity', async () => {

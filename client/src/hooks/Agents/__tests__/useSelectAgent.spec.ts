@@ -60,7 +60,7 @@ describe('useSelectAgent', () => {
     );
   });
 
-  it('opens a fresh composer first and keeps it when the agent details arrive', async () => {
+  it('opens one fresh composer without waiting for or reopening it for metadata', async () => {
     mockFetchQuery.mockResolvedValue({ id: 'agent-1', name: 'Full Agent' });
     const { result } = renderHook(() => useSelectAgent());
 
@@ -68,12 +68,12 @@ describe('useSelectAgent', () => {
       await result.current.onSelect('agent-1');
     });
 
-    expect(mockNewConversation).toHaveBeenCalledTimes(2);
-    expect(mockNewConversation.mock.calls[0][0].keepComposerState).toBe(false);
-    expect(mockNewConversation.mock.calls[1][0].keepComposerState).toBe(true);
+    expect(mockNewConversation).toHaveBeenCalledTimes(1);
+    expect(mockNewConversation.mock.calls[0][0].keepComposerState).toBeUndefined();
+    expect(mockFetchQuery).not.toHaveBeenCalled();
   });
 
-  it('keeps the composer when the agent details cannot be fetched', async () => {
+  it('does not couple selection to a metadata request', async () => {
     const consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     mockFetchQuery.mockRejectedValue(new Error('offline'));
     const { result } = renderHook(() => useSelectAgent());
@@ -82,8 +82,8 @@ describe('useSelectAgent', () => {
       await result.current.onSelect('agent-1');
     });
 
-    expect(mockNewConversation).toHaveBeenCalledTimes(2);
-    expect(mockNewConversation.mock.calls[1][0].keepComposerState).toBe(true);
+    expect(mockNewConversation).toHaveBeenCalledTimes(1);
+    expect(mockFetchQuery).not.toHaveBeenCalled();
     consoleError.mockRestore();
   });
 
@@ -99,8 +99,8 @@ describe('useSelectAgent', () => {
     });
 
     expect(mockGetDefaultConversation).not.toHaveBeenCalled();
-    expect(mockNewConversation.mock.calls[0][0].keepComposerState).toBe(false);
-    expect(mockNewConversation.mock.calls[1][0].keepComposerState).toBe(true);
+    expect(mockNewConversation.mock.calls[0][0].keepComposerState).toBeUndefined();
+    expect(mockFetchQuery).not.toHaveBeenCalled();
   });
 
   it('clears model spec display fields when selecting an agent', async () => {
@@ -124,6 +124,48 @@ describe('useSelectAgent', () => {
       spec: null,
       iconURL: null,
       modelLabel: null,
+      codeWorkspaces: undefined,
     });
+  });
+
+  it('does not carry a prior agent workspace binding into the selected agent', async () => {
+    mockGetConversation.mockResolvedValue({
+      endpoint: EModelEndpoint.agents,
+      agent_id: 'agent-old',
+      codeWorkspaces: [{ environmentId: 'machine-a', workspaceId: 'project-old' }],
+    } as TConversation);
+    mockFetchQuery.mockResolvedValue({ id: 'agent-1', name: 'Full Agent' });
+    const { result } = renderHook(() => useSelectAgent());
+
+    await act(async () => {
+      await result.current.onSelect('agent-1');
+    });
+
+    expect(mockNewConversation.mock.calls[0][0].template.codeWorkspaces).toBeUndefined();
+    expect(mockFetchQuery).not.toHaveBeenCalled();
+    expect(mockGetDefaultConversation.mock.calls[0][0].conversation.codeWorkspaces).toBeUndefined();
+  });
+
+  it('leaves subsequent workspace choices to the active conversation', async () => {
+    const selectedWorkspace = [{ environmentId: 'machine-a', workspaceId: 'project-a' }];
+    mockGetConversation
+      .mockResolvedValueOnce({
+        endpoint: EModelEndpoint.agents,
+        agent_id: 'agent-old',
+      } as TConversation)
+      .mockResolvedValueOnce({
+        endpoint: EModelEndpoint.agents,
+        agent_id: 'agent-1',
+        codeWorkspaces: selectedWorkspace,
+      } as TConversation);
+    mockFetchQuery.mockResolvedValue({ id: 'agent-1', name: 'Full Agent' });
+    const { result } = renderHook(() => useSelectAgent());
+
+    await act(async () => {
+      await result.current.onSelect('agent-1');
+    });
+
+    expect(mockNewConversation.mock.calls[0][0].template.codeWorkspaces).toBeUndefined();
+    expect(mockFetchQuery).not.toHaveBeenCalled();
   });
 });

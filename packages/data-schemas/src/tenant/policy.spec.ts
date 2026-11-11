@@ -1,12 +1,14 @@
 import type { TenantScope } from './policy';
 import {
   tenantFilter,
+  tenantPartition,
   scopeReplacement,
   currentTenantScope,
   resolveTenantScope,
   TenantIsolationError,
   stampTenantOnDocument,
   sanitizeTenantMutation,
+  tenantWritePredicate,
   resetTenantStrictCache,
 } from './policy';
 import { tenantStorage, SYSTEM_TENANT_ID } from '~/config/tenantContext';
@@ -110,6 +112,17 @@ describe('tenantFilter', () => {
   it('does not restrict system or unscoped reads', () => {
     expect(tenantFilter(SYSTEM)).toBeUndefined();
     expect(tenantFilter(UNSCOPED)).toBeUndefined();
+  });
+});
+
+describe('tenantPartition', () => {
+  it('names the active tenant when scoped', () => {
+    expect(tenantPartition(SCOPED)).toBe('tenant-a');
+  });
+
+  it('names the tenantless partition for system and unscoped reads', () => {
+    expect(tenantPartition(SYSTEM)).toBeNull();
+    expect(tenantPartition(UNSCOPED)).toBeNull();
   });
 });
 
@@ -251,6 +264,30 @@ describe('scopeReplacement', () => {
     const replacement = { name: 'x' };
     scopeReplacement(SCOPED, replacement);
     expect(replacement).toEqual({ name: 'x' });
+  });
+});
+
+describe('tenantWritePredicate', () => {
+  it('matches the active tenant or an explicitly legacy value', () => {
+    expect(tenantWritePredicate(SCOPED, false, undefined)).toEqual({
+      tenantId: { $in: ['tenant-a', null, ''] },
+    });
+  });
+
+  it('allows a modified tenantId that still names the active tenant', () => {
+    expect(tenantWritePredicate(SCOPED, true, 'tenant-a')).toEqual({
+      tenantId: { $in: ['tenant-a', null, ''] },
+    });
+  });
+
+  it('rejects a cross-tenant tenantId modification outside system scope', () => {
+    expect(() => tenantWritePredicate(SCOPED, true, 'tenant-b')).toThrow(TenantIsolationError);
+    expect(() => tenantWritePredicate(UNSCOPED, true, 'tenant-a')).toThrow(TenantIsolationError);
+  });
+
+  it('yields nothing for system or unscoped saves', () => {
+    expect(tenantWritePredicate(SYSTEM, true, 'tenant-b')).toBeUndefined();
+    expect(tenantWritePredicate(UNSCOPED, false, undefined)).toBeUndefined();
   });
 });
 

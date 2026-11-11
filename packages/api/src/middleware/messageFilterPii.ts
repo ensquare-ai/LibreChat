@@ -15,6 +15,7 @@ import type {
   Response as ServerResponse,
 } from 'express';
 import type { FiltersConfig, MessageFilterPiiConfig } from 'librechat-data-provider';
+import type { LocatorTraversalReporter } from '../protection/diagnostics';
 import type { TextContentFragment } from '../protection/types';
 import {
   contentFilterUninspectableResponse,
@@ -39,7 +40,6 @@ import {
   extractFileContent,
   extractStoredMessageContent,
 } from '../protection/adapters/submissions';
-import { createLegacyPiiInspector, toLegacyPiiMatch } from '../protection/legacy';
 import { extractMessageContent } from '../protection/adapters/messages';
 import { extractChatContent } from '../protection/adapters/chat';
 import { contentFilterBlockResponse } from './contentFilter';
@@ -113,38 +113,12 @@ function isLegacyPiiConfigValid(config: MessageFilterPiiConfig): boolean {
   return valid;
 }
 
-export interface PiiMatch {
-  id: string;
-  label: string;
-  /** Set when a configured custom pattern cannot be enforced by the runtime engine. */
-  misconfigured?: boolean;
-}
-
-type ContentPart = { type?: string; text?: string; [key: string]: unknown };
-type ChatLikeMessage = {
-  role?: string;
-  content?: string | ContentPart[];
-};
-
-export function findPiiMatchInMessages(
-  messages: ChatLikeMessage[] | undefined,
-  config: MessageFilterPiiConfig | undefined,
-): PiiMatch | null {
-  if (config == null || !Array.isArray(messages) || messages.length === 0) {
-    return null;
-  }
-  if (!isLegacyPiiConfigValid(config)) {
-    return { id: '__misconfigured__', label: 'restricted value', misconfigured: true };
-  }
-  const inspector = createLegacyPiiInspector(config);
-  const fragments = extractMessageContent(messages);
-  return toLegacyPiiMatch(inspector?.inspect(fragments) ?? null);
-}
-
 export interface CreateMessageFilterPiiOptions {
+  readonly onTraversalFailure?: LocatorTraversalReporter;
   getConfig: (req: ServerRequest) => MessageFilterPiiConfig | undefined;
   getFilters?: (req: ServerRequest) => FiltersConfig | undefined;
   getFiles?: GetCanonicalFilesForInspection;
+  getPreinspectedText?: (req: ServerRequest) => string | undefined;
 }
 
 export function createMessageFilterPii(options: CreateMessageFilterPiiOptions): RequestHandler {
@@ -172,6 +146,8 @@ export function createMessageFilterPii(options: CreateMessageFilterPiiOptions): 
     if (options.getFiles != null && hasActiveFilePolicy(filters)) {
       try {
         const fileInspection = await resolveCanonicalFileReferences({
+          messageCount: 1,
+          onTraversalFailure: options.onTraversalFailure,
           filters,
           input: req.body,
           user: (
@@ -237,7 +213,18 @@ export function createMessageFilterPii(options: CreateMessageFilterPiiOptions): 
     if (filters != null && !collect(() => extractStoredMessageContent(req.body))) {
       return;
     }
-    const finding = inspectContent(fragments, { filters, legacyPii });
+    const preinspectedText = options.getPreinspectedText?.(req);
+    const inspectable =
+      preinspectedText == null
+        ? fragments
+        : fragments.filter(
+            (fragment) =>
+              fragment.source !== 'message' ||
+              fragment.field !== 'text' ||
+              fragment.path !== '/text' ||
+              fragment.text !== preinspectedText,
+          );
+    const finding = inspectContent(inspectable, { filters, legacyPii });
     if (finding != null) {
       if (finding.detectorId !== 'legacy-pattern') {
         res.status(400).json(contentFilterBlockResponse(finding));

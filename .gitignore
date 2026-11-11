@@ -27,7 +27,6 @@ coverage
 .grunt
 
 # translation services
-config/translations/stores/*
 client/src/localization/languages/*_missing_keys.json
 
 # Turborepo
@@ -81,7 +80,6 @@ librechat.yaml
 librechat.yml
 
 # Environment
-.npmrc
 .env*
 my.secrets
 !**/.env.example
@@ -192,5 +190,12 @@ codedb.snapshot
 scripts/activity-labels/results/
 
 !e2e/lighthouse/librechat.yaml
-/.lighthouseci/
+/.lighthouse/
 /e2e/lighthouse/.test-results/
+/e2e/rum/.test-results/
+# Chrome user-data directories a Lighthouse run leaves in the repository root when the browser
+# is handed a Windows profile path from WSL: the whole path arrives as one directory name.
+/*lighthouse.[0-9]*/
+
+# Mutation testing sandboxes
+.stryker-tmp/

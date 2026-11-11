@@ -1,3 +1,4 @@
+import { bindToolApproval, bindToolApprovalIdentity, getToolApprovalIdentity } from './approval';
 /**
  * @fileoverview Tool definitions loader for event-driven mode.
  * Loads tool definitions without creating tool instances for efficient initialization.
@@ -5,7 +6,7 @@
  * @module packages/api/src/tools/definitions
  */
 
-import { Providers } from '@librechat/agents';
+import { Providers, GitHubCompareToolName } from '@librechat/agents';
 import {
   Constants,
   isActionTool,
@@ -16,6 +17,8 @@ import {
 } from 'librechat-data-provider';
 import type { LCToolRegistry, JsonSchemaType, LCTool, GenericTool } from '@librechat/agents';
 import type { AgentToolOptions } from 'librechat-data-provider';
+import type { CodeEnvironmentConfig, CodeExecutionContext } from '~/agents/execution';
+import type { CodeCapabilityConfigLoader } from '~/code/capabilities';
 import type { MCPToolAlias, ToolDefinition } from './classification';
 import { resolveJsonSchemaRefs, normalizeJsonSchema, sanitizeGeminiSchema } from '~/mcp/zod';
 import { buildToolClassification } from './classification';
@@ -41,6 +44,8 @@ export interface LoadToolDefinitionsParams {
   agentId: string;
   /** Agent's tool list (tool names/identifiers) */
   tools: string[];
+  /** Explicit deployment opt-in for read-only GitHub comparisons. */
+  githubCompareEnabled?: boolean;
   /** Agent-specific tool options */
   toolOptions?: AgentToolOptions;
   /** Whether deferred tools feature is enabled */
@@ -49,6 +54,9 @@ export interface LoadToolDefinitionsParams {
   programmaticToolsEnabled?: boolean;
   /** Whether code execution is enabled and requested by this agent */
   codeExecutionEnabled?: boolean;
+  codeExecutionContext?: CodeExecutionContext;
+  codeEnvironments?: readonly CodeEnvironmentConfig[];
+  getAppConfig?: CodeCapabilityConfigLoader;
   /** Agent provider — Gemini/Vertex tool schemas get union-flattened for compatibility */
   provider?: Providers;
   /** Configured server names, used to resolve the tool-key boundary exactly */
@@ -127,6 +135,9 @@ export async function loadToolDefinitions(
     deferredToolsEnabled = false,
     programmaticToolsEnabled = false,
     codeExecutionEnabled = false,
+    codeExecutionContext,
+    codeEnvironments,
+    getAppConfig,
     provider,
     mcpServerNames,
     rawServerNames,
@@ -176,6 +187,9 @@ export async function loadToolDefinitions(
   let resolvedMCPToolCount = 0;
 
   for (const toolName of tools) {
+    if (toolName === GitHubCompareToolName && params.githubCompareEnabled !== true) {
+      continue;
+    }
     if (isActionTool(toolName)) {
       actionToolNames.push(toolName);
       continue;
@@ -303,13 +317,28 @@ export async function loadToolDefinitions(
     if (isMCPAllPlaceholder(toolName)) {
       for (const [actualToolName, toolDef] of Object.entries(serverTools)) {
         if (toolDef?.function) {
-          mcpToolDefs.push({
-            name: actualToolName,
-            description: toolDef.function.description || undefined,
-            parameters: buildMcpParameters(toolDef.function.parameters),
-            serverName,
-            serverToolName: toolDef.serverToolName,
-          });
+          mcpToolDefs.push(
+            bindToolApprovalIdentity(
+              {
+                name: actualToolName,
+                description: toolDef.function.description || undefined,
+                parameters: buildMcpParameters(toolDef.function.parameters),
+                serverName,
+                serverToolName: toolDef.serverToolName,
+              },
+              toolDef.serverToolName ??
+                actualToolName.slice(
+                  0,
+                  -`${Constants.mcp_delimiter}${normalizeServerName(serverName)}`.length,
+                ),
+              normalizeJsonSchema(
+                resolveJsonSchemaRefs(
+                  toolDef.function.parameters ?? { type: 'object', properties: {} },
+                ),
+              ),
+              toolDef.function.description || undefined,
+            ),
+          );
           resolvedMCPToolCount++;
         }
       }
@@ -318,14 +347,29 @@ export async function loadToolDefinitions(
 
     const toolMatch = findToolMatch(serverTools);
     if (toolMatch?.def.function) {
-      mcpToolDefs.push({
-        name: toolName,
-        description: toolMatch.def.function.description || undefined,
-        parameters: buildMcpParameters(toolMatch.def.function.parameters),
-        serverName,
-        serverToolName: toolMatch.def.serverToolName,
-        currentToolName: toolMatch.currentToolName,
-      });
+      mcpToolDefs.push(
+        bindToolApprovalIdentity(
+          {
+            name: toolName,
+            description: toolMatch.def.function.description || undefined,
+            parameters: buildMcpParameters(toolMatch.def.function.parameters),
+            serverName,
+            serverToolName: toolMatch.def.serverToolName,
+            currentToolName: toolMatch.currentToolName,
+          },
+          toolMatch.def.serverToolName ??
+            toolName.slice(
+              0,
+              -`${Constants.mcp_delimiter}${normalizeServerName(serverName)}`.length,
+            ),
+          normalizeJsonSchema(
+            resolveJsonSchemaRefs(
+              toolMatch.def.function.parameters ?? { type: 'object', properties: {} },
+            ),
+          ),
+          toolMatch.def.function.description || undefined,
+        ),
+      );
       resolvedMCPToolCount++;
     }
   }
@@ -345,15 +389,22 @@ export async function loadToolDefinitions(
     });
   }
 
-  const loadedTools = mcpToolDefs.map((def) => ({
-    name: def.name,
-    description: def.description,
-    mcp: true as const,
-    mcpJsonSchema: def.parameters,
-    mcpRawServerName: def.serverName,
-    mcpServerToolName: def.serverToolName,
-    mcpCurrentToolName: def.currentToolName,
-  })) as unknown as GenericTool[];
+  const loadedTools = mcpToolDefs.map((def) =>
+    bindToolApproval(
+      {
+        name: def.name,
+        description: def.description,
+        mcp: true as const,
+        mcpJsonSchema: def.parameters,
+        mcpRawServerName: def.serverName,
+        mcpServerToolName: def.serverToolName,
+        mcpCurrentToolName: def.currentToolName,
+      },
+      undefined,
+      undefined,
+      getToolApprovalIdentity(def),
+    ),
+  ) as unknown as GenericTool[];
 
   const classificationResult = await buildToolClassification({
     userId,
@@ -363,6 +414,9 @@ export async function loadToolDefinitions(
     deferredToolsEnabled,
     programmaticToolsEnabled,
     codeExecutionEnabled,
+    codeExecutionContext,
+    codeEnvironments,
+    getAppConfig,
     definitionsOnly: true,
     agentToolOptions: toolOptions,
   });

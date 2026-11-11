@@ -1,6 +1,6 @@
-import { Constants } from 'librechat-data-provider';
+import { Constants, MAX_SUBAGENT_GRAPH_NODES } from 'librechat-data-provider';
 import type { AppConfig } from '@librechat/data-schemas';
-import { getResumeContentInspection } from './inspection';
+import { getResumeAgentSnapshot, getResumeContentInspection } from './inspection';
 
 const strictExtractedTextConfig = {
   filters: {
@@ -55,6 +55,30 @@ function buildInput(trustLiveFileContent?: boolean) {
 }
 
 describe('resume file inspection trust boundary', () => {
+  it('resumes a long persisted branch with one batched owner-file lookup', async () => {
+    const input = buildInput();
+    const history = Array.from({ length: 58 }, (_, index) => ({
+      messageId: `history-${index}`,
+      parentMessageId: index === 0 ? String(Constants.NO_PARENT) : `history-${index - 1}`,
+      conversationId: 'conversation-1',
+      isCreatedByUser: true,
+      content: Array.from({ length: 80 }, () => ({ type: 'text', text: 'safe history' })),
+      files: index === 57 ? [{ file_id: 'owned-file' }] : [],
+    }));
+    input.getMessages.mockResolvedValue(history);
+    input.getFiles.mockResolvedValue([{ file_id: 'owned-file', text: 'safe extraction' }]);
+    const result = await getResumeContentInspection({
+      ...input,
+      targetMessageId: 'history-57',
+      supplementalMessages: [],
+      fileReferenceInputs: history,
+    });
+    expect(result.storedMessages).toHaveLength(58);
+    expect(result.originalStoredMessages).toEqual(history);
+    expect(result.hydratedFiles).toEqual([{ file_id: 'owned-file', text: 'safe extraction' }]);
+    expect(input.getFiles).toHaveBeenCalledTimes(1);
+  });
+
   it('does not accept request/job file metadata as extraction coverage', async () => {
     await expect(getResumeContentInspection(buildInput())).rejects.toMatchObject({
       code: 'content_filter_uninspectable',
@@ -136,5 +160,48 @@ describe('resume file inspection trust boundary', () => {
 
     expect(result.storedMessages).toEqual([]);
     expect(getMessages).not.toHaveBeenCalled();
+  });
+});
+
+describe('getResumeAgentSnapshot', () => {
+  it('stops fetching references once the node budget is exceeded', async () => {
+    const total = MAX_SUBAGENT_GRAPH_NODES * 20;
+    const edges = Array.from({ length: total }, (_, index) => ({
+      from: 'primary',
+      to: `child-${index}`,
+      edgeType: 'handoff' as const,
+    }));
+    const getAgent = jest.fn(async ({ id }: { id: string }) => ({ id }) as never);
+
+    await expect(
+      getResumeAgentSnapshot({
+        primaryAgent: { id: 'primary', edges } as never,
+        subagentsEnabled: false,
+        getAgent,
+      }),
+    ).rejects.toThrow();
+    expect(getAgent.mock.calls.length).toBeLessThan(MAX_SUBAGENT_GRAPH_NODES + 10);
+  });
+
+  it('rejects on a failed lookup without waiting for a stalled sibling', async () => {
+    const edges = ['slow', 'fails'].map((to) => ({
+      from: 'primary',
+      to,
+      edgeType: 'handoff' as const,
+    }));
+    const getAgent = jest.fn(async ({ id }: { id: string }) => {
+      if (id === 'slow') {
+        return new Promise<never>(() => undefined);
+      }
+      throw new Error('lookup failed');
+    });
+
+    await expect(
+      getResumeAgentSnapshot({
+        primaryAgent: { id: 'primary', edges } as never,
+        subagentsEnabled: false,
+        getAgent,
+      }),
+    ).rejects.toThrow();
   });
 });

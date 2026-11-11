@@ -42,7 +42,8 @@ jest.mock('~/server/services/MCP', () => ({
 }));
 
 jest.mock('~/server/services/ToolService', () => ({
-  isFatalAgentInitializationError: (error) =>
+  isFatalAgentInitializationError: (error, { signal } = {}) =>
+    (signal?.aborted === true && (error === signal.reason || error?.name === 'AbortError')) ||
     ['AGENT_EXPECTED_MCP_TOOLS_UNAVAILABLE', 'resource_recovery_required'].includes(error?.code),
 }));
 
@@ -119,6 +120,23 @@ describe('processAddedConvo', () => {
     );
   });
 
+  /** The added convo re-hydrates the same conversation's prior-turn files, so a
+   *  denied `FILE_SEARCH` grant has to travel with it — otherwise the parallel
+   *  agent primes the search files the primary just skipped. `undefined` stays
+   *  `undefined`, which leaves priming unconditional for callers that never
+   *  resolved the grant. */
+  it.each([true, false, undefined])(
+    'forwards fileSearchAvailable=%s verbatim to the added-convo initializeAgent call',
+    async (fileSearchAvailable) => {
+      await processAddedConvo(baseParams({ fileSearchAvailable }));
+
+      expect(mockInitializeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({ fileSearchAvailable }),
+        expect.anything(),
+      );
+    },
+  );
+
   it('forwards codeEnvAvailable=false verbatim (not coerced to undefined)', async () => {
     /* Symmetric coverage: if the runtime gate is off for the primary, the
        parallel agent must not accidentally re-enable code execution via a
@@ -154,6 +172,19 @@ describe('processAddedConvo', () => {
     mockInitializeAgent.mockRejectedValueOnce(toolError);
 
     await expect(processAddedConvo(baseParams())).rejects.toBe(toolError);
+  });
+
+  it('forwards and propagates owning-run cancellation from added-agent initialization', async () => {
+    const controller = new AbortController();
+    const reason = new Error('parallel agent stopped');
+    controller.abort(reason);
+    mockInitializeAgent.mockRejectedValueOnce(reason);
+
+    await expect(processAddedConvo(baseParams({ signal: controller.signal }))).rejects.toBe(reason);
+    expect(mockInitializeAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ signal: controller.signal }),
+      expect.anything(),
+    );
   });
 
   it('keeps deployment-aware skill metadata on a persisted added-agent config', async () => {
@@ -278,11 +309,13 @@ describe('processAddedConvo', () => {
       }),
     );
 
-    expect(mockResolveModelSpecSkillIds).toHaveBeenCalledWith({
-      names: ['finance-analyst'],
-      accessibleSkillIds: [accessibleSkillId],
-      getSkillByName: mockRegistryGetSkillByName,
-    });
+    expect(mockResolveModelSpecSkillIds).toHaveBeenCalledWith(
+      expect.objectContaining({
+        names: ['finance-analyst'],
+        accessibleSkillIds: [accessibleSkillId],
+        getSkillByName: mockRegistryGetSkillByName,
+      }),
+    );
     expect(mockResolveAgentScopedSkillIds).toHaveBeenNthCalledWith(1, {
       agent: expect.objectContaining({
         id: Constants.EPHEMERAL_AGENT_ID,
@@ -328,5 +361,54 @@ describe('processAddedConvo', () => {
       }),
     );
     expect(mockGetSkillDbMethods).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['honors the shared skills opt-out for an ordinary added spec', undefined, false],
+    ['ignores it when the added spec hides its badge row', true, true],
+  ])('%s', async (_label, hideBadgeRow, expectedEnabled) => {
+    mockResolveAgentScopedSkillIds.mockReturnValue([]);
+    mockCanAuthorSkillFiles.mockReturnValue(false);
+
+    /** The added pane has no badge row of its own; when its spec hides one,
+     *  the other pane's toggle must not strip what that spec configured. */
+    await processAddedConvo(
+      baseParams({
+        req: {
+          user: { id: 'u1', role: 'USER' },
+          body: { ephemeralAgent: { skills: false } },
+          config: {
+            modelSpecs: {
+              list: [
+                {
+                  name: 'added-spec',
+                  skills: true,
+                  ...(hideBadgeRow ? { hideBadgeRow } : {}),
+                },
+              ],
+            },
+          },
+        },
+        endpointOption: {
+          spec: 'primary-spec',
+          addedConvo: {
+            endpoint: 'openai',
+            model: 'gpt-4o',
+            spec: 'added-spec',
+          },
+        },
+        accessibleSkillIds: [],
+        editableSkillIds: [],
+        skillsCapabilityEnabled: true,
+        ephemeralSkillsToggle: false,
+        skillCreateAllowed: false,
+      }),
+    );
+
+    expect(mockResolveAgentScopedSkillIds).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agent: expect.objectContaining({ skills_enabled: expectedEnabled }),
+      }),
+    );
   });
 });

@@ -45,7 +45,6 @@ jest.mock('sharp', () =>
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   refreshS3FileUrls: jest.fn(),
-  deleteRagFile: jest.fn().mockResolvedValue(true),
   getCodeExecutionBaseUrl: jest.fn((profile, environment) => {
     if (environment?.baseURL) {
       return environment.baseURL;
@@ -74,7 +73,7 @@ jest.mock('~/config', () => ({
 
 const { processDeleteRequest } = require('~/server/services/Files/process');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
-const { createCodeExecutionRouteKey, deleteRagFile } = require('@librechat/api');
+const { createCodeExecutionRouteKey } = require('@librechat/api');
 
 // Import the router after mocks
 const router = require('./files');
@@ -323,23 +322,24 @@ describe('File Routes - Delete with Agent Access', () => {
       expect(response.status).toBe(200);
       expect(response.body.message).toBe('File associations removed successfully from agent');
       expect(processDeleteRequest).not.toHaveBeenCalled();
-      expect(deleteRagFile).not.toHaveBeenCalled();
 
       const updatedAgent = await Agent.findOne({ id: agent.id }).lean();
       expect(updatedAgent.tool_resources.file_search.file_ids).toEqual([]);
     });
 
-    it('removes the embeddings filed under the agent when an embedded file leaves file_search', async () => {
-      const embeddedFileId = uuidv4();
+    it('deletes storage and embeddings for an attached file the caller owns', async () => {
+      const ownedFileId = uuidv4();
       await createFile({
         user: otherUserId,
-        file_id: embeddedFileId,
-        filename: 'embedded.txt',
-        filepath: '/uploads/embedded.txt',
+        file_id: ownedFileId,
+        filename: 'owned-knowledge.txt',
+        filepath: '/uploads/owned-knowledge.txt',
         bytes: 100,
         type: 'text/plain',
+        source: FileSources.vectordb,
         embedded: true,
       });
+
       const agent = await createAgent({
         id: uuidv4(),
         name: 'Test Agent',
@@ -348,7 +348,52 @@ describe('File Routes - Delete with Agent Access', () => {
         author: otherUserId,
         tool_resources: {
           file_search: {
-            file_ids: [embeddedFileId, fileId],
+            file_ids: [ownedFileId],
+          },
+        },
+      });
+
+      const response = await request(app)
+        .delete('/files')
+        .send({
+          agent_id: agent.id,
+          tool_resource: 'file_search',
+          files: [{ file_id: ownedFileId, filepath: '/uploads/owned-knowledge.txt' }],
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.message).toBe('Files deleted successfully');
+      expect(processDeleteRequest).toHaveBeenCalledTimes(1);
+
+      const [{ req, files: deletedFiles }] = processDeleteRequest.mock.calls[0];
+      expect(deletedFiles.map((file) => file.file_id)).toEqual([ownedFileId]);
+      expect(deletedFiles[0].source).toBe(FileSources.vectordb);
+      expect(req.body.agent_id).toBe(agent.id);
+      expect(req.body.tool_resource).toBe('file_search');
+    });
+
+    it('unlinks another user’s attached file while deleting the caller’s own', async () => {
+      const ownedFileId = uuidv4();
+      await createFile({
+        user: otherUserId,
+        file_id: ownedFileId,
+        filename: 'owned-knowledge.txt',
+        filepath: '/uploads/owned-knowledge.txt',
+        bytes: 100,
+        type: 'text/plain',
+        source: FileSources.vectordb,
+        embedded: true,
+      });
+
+      const agent = await createAgent({
+        id: uuidv4(),
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: otherUserId,
+        tool_resources: {
+          file_search: {
+            file_ids: [ownedFileId, fileId],
           },
         },
       });
@@ -359,42 +404,39 @@ describe('File Routes - Delete with Agent Access', () => {
           agent_id: agent.id,
           tool_resource: 'file_search',
           files: [
-            { file_id: embeddedFileId, filepath: '/uploads/embedded.txt' },
+            { file_id: ownedFileId, filepath: '/uploads/owned-knowledge.txt' },
             { file_id: fileId, filepath: '/uploads/test.txt' },
           ],
         });
 
       expect(response.status).toBe(200);
-      expect(response.body.message).toBe('File associations removed successfully from agent');
-      expect(processDeleteRequest).not.toHaveBeenCalled();
+      expect(response.body.message).toBe('Files deleted successfully');
 
-      /** The embeddings are the agent's, so the delete names the agent; the file that was
-       * never embedded asks the RAG API for nothing. */
-      expect(deleteRagFile).toHaveBeenCalledTimes(1);
-      expect(deleteRagFile).toHaveBeenCalledWith({
-        userId: otherUserId.toString(),
-        file: expect.objectContaining({ file_id: embeddedFileId, embedded: true }),
-        entityId: agent.id,
-      });
+      const [{ files: deletedFiles }] = processDeleteRequest.mock.calls[0];
+      expect(deletedFiles.map((file) => file.file_id)).toEqual([ownedFileId]);
 
-      /** The record is still the owner's: unlinking is not deletion. */
-      const record = await File.findOne({ file_id: embeddedFileId }).lean();
-      expect(record).not.toBeNull();
       const updatedAgent = await Agent.findOne({ id: agent.id }).lean();
-      expect(updatedAgent.tool_resources.file_search.file_ids).toEqual([]);
+      expect(updatedAgent.tool_resources.file_search.file_ids).toEqual([ownedFileId]);
+
+      const retainedFile = await File.findOne({ file_id: fileId }).lean();
+      expect(retainedFile).toBeTruthy();
     });
 
-    it('leaves embeddings alone when the file leaves a tool resource other than file_search', async () => {
-      const embeddedFileId = uuidv4();
+    it('keeps a file the same agent holds under another tool resource', async () => {
+      const sharedFileId = uuidv4();
       await createFile({
         user: otherUserId,
-        file_id: embeddedFileId,
-        filename: 'embedded.txt',
-        filepath: '/uploads/embedded.txt',
+        file_id: sharedFileId,
+        filename: 'dual-purpose.txt',
+        filepath: '/uploads/dual-purpose.txt',
         bytes: 100,
         type: 'text/plain',
+        source: FileSources.vectordb,
         embedded: true,
       });
+
+      /* One agent can hold the same file under two resources, so the reference being removed is the
+         `(agent, tool_resource)` pair rather than the agent. */
       const agent = await createAgent({
         id: uuidv4(),
         name: 'Test Agent',
@@ -402,8 +444,108 @@ describe('File Routes - Delete with Agent Access', () => {
         model: 'gpt-4',
         author: otherUserId,
         tool_resources: {
-          context: {
-            file_ids: [embeddedFileId],
+          file_search: { file_ids: [sharedFileId] },
+          context: { file_ids: [sharedFileId] },
+        },
+      });
+
+      const response = await request(app)
+        .delete('/files')
+        .send({
+          agent_id: agent.id,
+          tool_resource: 'file_search',
+          files: [{ file_id: sharedFileId, filepath: '/uploads/dual-purpose.txt' }],
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.message).toBe('File associations removed successfully from agent');
+      expect(processDeleteRequest).not.toHaveBeenCalled();
+
+      const updatedAgent = await Agent.findOne({ id: agent.id }).lean();
+      expect(updatedAgent.tool_resources.file_search.file_ids).toEqual([]);
+      expect(updatedAgent.tool_resources.context.file_ids).toEqual([sharedFileId]);
+
+      const retainedFile = await File.findOne({ file_id: sharedFileId }).lean();
+      expect(retainedFile).toBeTruthy();
+    });
+
+    it('keeps a file a duplicated agent still references, unlinking it here only', async () => {
+      const sharedFileId = uuidv4();
+      await createFile({
+        user: otherUserId,
+        file_id: sharedFileId,
+        filename: 'shared-knowledge.txt',
+        filepath: '/uploads/shared-knowledge.txt',
+        bytes: 100,
+        type: 'text/plain',
+        source: FileSources.vectordb,
+        embedded: true,
+      });
+
+      const agent = await createAgent({
+        id: uuidv4(),
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: otherUserId,
+        tool_resources: { file_search: { file_ids: [sharedFileId] } },
+      });
+
+      /* Duplicating an agent copies file_ids rather than the files behind them, and lands them
+         under `context`, so the second holder is found across tool resources. */
+      const duplicate = await createAgent({
+        id: uuidv4(),
+        name: 'Test Agent (copy)',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: otherUserId,
+        tool_resources: { context: { file_ids: [sharedFileId] } },
+      });
+
+      const response = await request(app)
+        .delete('/files')
+        .send({
+          agent_id: agent.id,
+          tool_resource: 'file_search',
+          files: [{ file_id: sharedFileId, filepath: '/uploads/shared-knowledge.txt' }],
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.message).toBe('File associations removed successfully from agent');
+      expect(processDeleteRequest).not.toHaveBeenCalled();
+
+      const updatedAgent = await Agent.findOne({ id: agent.id }).lean();
+      expect(updatedAgent.tool_resources.file_search.file_ids).toEqual([]);
+
+      const untouchedDuplicate = await Agent.findOne({ id: duplicate.id }).lean();
+      expect(untouchedDuplicate.tool_resources.context.file_ids).toEqual([sharedFileId]);
+
+      const retainedFile = await File.findOne({ file_id: sharedFileId }).lean();
+      expect(retainedFile).toBeTruthy();
+    });
+
+    it('leaves an owned file alone when the tool resource does not hold it', async () => {
+      const ownedFileId = uuidv4();
+      await createFile({
+        user: otherUserId,
+        file_id: ownedFileId,
+        filename: 'detached-knowledge.txt',
+        filepath: '/uploads/detached-knowledge.txt',
+        bytes: 100,
+        type: 'text/plain',
+        source: FileSources.vectordb,
+        embedded: true,
+      });
+
+      const agent = await createAgent({
+        id: uuidv4(),
+        name: 'Test Agent',
+        provider: 'openai',
+        model: 'gpt-4',
+        author: otherUserId,
+        tool_resources: {
+          file_search: {
+            file_ids: [fileId],
           },
         },
       });
@@ -412,12 +554,16 @@ describe('File Routes - Delete with Agent Access', () => {
         .delete('/files')
         .send({
           agent_id: agent.id,
-          tool_resource: 'context',
-          files: [{ file_id: embeddedFileId, filepath: '/uploads/embedded.txt' }],
+          tool_resource: 'file_search',
+          files: [{ file_id: ownedFileId, filepath: '/uploads/detached-knowledge.txt' }],
         });
 
       expect(response.status).toBe(200);
-      expect(deleteRagFile).not.toHaveBeenCalled();
+      expect(response.body.message).toBe('File associations removed successfully from agent');
+      expect(processDeleteRequest).not.toHaveBeenCalled();
+
+      const updatedAgent = await Agent.findOne({ id: agent.id }).lean();
+      expect(updatedAgent.tool_resources.file_search.file_ids).toEqual([fileId]);
     });
 
     it('rejects invalid agent tool_resource values before unlinking', async () => {

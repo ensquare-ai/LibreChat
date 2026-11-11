@@ -1,6 +1,6 @@
 const archiveAllHandler = jest.fn();
 const generationJobManager = {
-  getJob: jest.fn().mockResolvedValue(null),
+  getCleanupJob: jest.fn().mockResolvedValue(null),
   abortJob: jest.fn().mockResolvedValue({ success: true }),
   getCleanupBlockingJobIdsForUser: jest.fn().mockResolvedValue([]),
   getCleanupBlockingJobIdsForConversations: jest.fn().mockResolvedValue([]),
@@ -13,19 +13,86 @@ const moderateText = jest.fn((req, _res, next) => {
 });
 const messageIpLimiter = jest.fn((_req, _res, next) => next());
 const messageUserLimiter = jest.fn((_req, _res, next) => next());
+const checkpointRows = [];
+const deleteAgentCheckpoints = jest.fn(async (threadIds = []) => {
+  for (let index = checkpointRows.length - 1; index >= 0; index -= 1) {
+    if (threadIds.includes(checkpointRows[index].threadId)) {
+      checkpointRows.splice(index, 1);
+    }
+  }
+});
+const ownerPrefix = (userId, tenantId) =>
+  `lcg:v2:${require('crypto')
+    .createHash('sha256')
+    .update(JSON.stringify([tenantId ?? null, userId]))
+    .digest('hex')}:`;
+const deleteOwnedAgentCheckpoints = jest.fn(async (userId, tenantId, threadIds) => {
+  for (let index = checkpointRows.length - 1; index >= 0; index -= 1) {
+    const row = checkpointRows[index];
+    if (
+      (threadIds == null || threadIds.includes(row.threadId)) &&
+      row.checkpointNamespace.startsWith(ownerPrefix(userId, tenantId))
+    ) {
+      checkpointRows.splice(index, 1);
+    }
+  }
+});
+const deletionTargets = new Map();
+const openCheckpointDeletion = jest.fn(async (userId, tenantId, root, cfg) => {
+  const key = JSON.stringify([userId, tenantId, root]);
+  const ids = deletionTargets.get(key) ?? new Set();
+  deletionTargets.set(key, ids);
+  return {
+    conversationIds: () => [...ids],
+    remember: async (targets) => targets.forEach((id) => ids.add(id)),
+    cleanup: async () =>
+      deleteOwnedAgentCheckpoints(userId, tenantId, root == null ? undefined : [...ids], cfg),
+    acknowledge: async () => deletionTargets.delete(key),
+  };
+});
+
+function resetCheckpointRows(rows = []) {
+  checkpointRows.splice(0, checkpointRows.length, ...rows);
+  deletionTargets.clear();
+}
+const markConvoSeenHandler = jest.fn();
+const markConvoUnreadHandler = jest.fn();
+const renameConversationHandler = jest.fn((_req, res) => res.status(204).end());
+const renameHandlerInputs = [];
+const archiveConversationHandler = jest.fn((_req, res) => res.status(200).json({}));
+const archiveHandlerInputs = [];
 
 module.exports = {
   archiveAllHandler,
+  archiveConversationHandler,
+  archiveHandlerInputs,
+  ownerPrefix,
   generationJobManager,
   subagentActivityHandlerInputs,
   moderateText,
   moderatedTexts,
   messageIpLimiter,
   messageUserLimiter,
+  checkpointRows,
+  resetCheckpointRows,
+  markConvoSeenHandler,
+  markConvoUnreadHandler,
+  renameConversationHandler,
+  renameHandlerInputs,
 
   agents: () => ({ sleep: jest.fn() }),
 
   api: (overrides = {}) => ({
+    withToolCallPreviews: (_req, result) => result,
+    createGeneratedTitleHandler: jest.fn(() => jest.fn()),
+    createRenameConversationHandler: jest.fn((deps) => {
+      renameHandlerInputs.push(deps);
+      return renameConversationHandler;
+    }),
+    createArchiveHandler: jest.fn((deps) => {
+      archiveHandlerInputs.push(deps);
+      return archiveConversationHandler;
+    }),
     /** Mirrors the real helper so query-flag parsing (`isArchived`, `pinned`) is exercised. */
     isEnabled: jest.fn((value) => {
       if (typeof value === 'boolean') {
@@ -45,6 +112,27 @@ module.exports = {
       }
       return Math.min(Math.max(limit, 1), max);
     }),
+    /** Mirrors the real whitelist and helpers so the route's sort normalization is exercised. */
+    CONVERSATION_SORT_FIELDS: {
+      title: true,
+      createdAt: true,
+      updatedAt: true,
+      archivedAt: true,
+    },
+    normalizeSortField: jest.fn((value, { fields, fallback }) => {
+      const raw = Array.isArray(value) ? value[0] : value;
+      return typeof raw === 'string' && fields[raw] === true ? raw : fallback;
+    }),
+    normalizeSortDirection: jest.fn((value, { fallback = 'desc' } = {}) => {
+      const raw = Array.isArray(value) ? value[0] : value;
+      return raw === 'asc' || raw === 'desc' ? raw : fallback;
+    }),
+    /** The real resolver and parser, so the route tests see the same 400s and configured
+     *  limits a request would. */
+    resolveConversationListFilters: jest.fn(
+      jest.requireActual('../../../../packages/api/src/conversations/filters.ts')
+        .resolveConversationListFilters,
+    ),
     resolveImportMaxFileSize: jest.fn(() => 262144000),
     createAxiosInstance: jest.fn(() => ({
       get: jest.fn(),
@@ -62,7 +150,25 @@ module.exports = {
       return archiveAllHandler;
     }),
     createSubagentThreadViewHandler: jest.fn(() => (_req, res) => res.status(200).json({})),
+    createSubagentTaskContentHandler: jest.fn(() => (_req, res) => res.status(200).json({})),
     createSubagentControlHandler: jest.fn(() => (_req, res) => res.status(200).json({})),
+    createSubagentControlReceiptHandler: () => jest.fn(),
+    createBackgroundTaskIndexHandler: jest.fn(
+      () => (_req, res) => res.status(200).json({ tasks: [] }),
+    ),
+    createBackgroundTaskPolicyMiddleware: jest.fn(() => (_req, _res, next) => next()),
+    createPullRequestSource: jest.fn(() => ({ find: jest.fn() })),
+    createProxyAwareFetch: jest.fn(() => jest.fn()),
+    createPullRequestLookup: jest.fn(() => jest.fn()),
+    createPullRequestLookupStore: jest.fn(() => undefined),
+    createPullRequestUserTokenFromEnv: jest.fn(() => undefined),
+    createConversationPullRequestsHandler: jest.fn(() => jest.fn()),
+    createConversationPullRequestHandler: jest.fn(
+      () => (_req, res) => res.status(200).json({ pullRequest: null }),
+    ),
+    createBackgroundTaskCancelHandler: jest.fn(
+      () => (_req, res) => res.status(200).json({ results: [] }),
+    ),
     isValidSubagentControlRequest: jest.fn((body) => {
       if (body == null || typeof body !== 'object') return false;
       const commonKeys = ['taskId', 'invocationId', 'action'];
@@ -96,6 +202,9 @@ module.exports = {
       () => (_req, res) => res.status(200).json({ threads: [] }),
     ),
     GenerationJobManager: generationJobManager,
+    waitForGenerationPersistence: jest.requireActual(
+      '../../../../packages/api/src/stream/persistence.ts',
+    ).waitForGenerationPersistence,
     isStopConfirmed: jest.fn(
       (result) => result?.success === true || result?.failureReason === 'already_settled',
     ),
@@ -103,9 +212,29 @@ module.exports = {
       subagentActivityHandlerInputs.push({ deps, stream });
       return (_req, res) => res.status(200).end();
     }),
+    /* Wiring only. The handlers' own validation and error mapping are covered against the
+       real implementations in `packages/api/src/conversations/read.spec.ts`; mirroring them
+       here would leave the route suite asserting against a copy. */
+    createMarkConvoSeenHandler: jest.fn(({ markConvoSeen }) => {
+      markConvoSeenHandler.mockImplementation(async (req, res) => {
+        const result = await markConvoSeen(req.user.id, req.body?.arg?.conversationId);
+        return res.status(200).json(result);
+      });
+      return markConvoSeenHandler;
+    }),
+    createMarkConvoUnreadHandler: jest.fn(({ markConvoUnread }) => {
+      markConvoUnreadHandler.mockImplementation(async (req, res) => {
+        const result = await markConvoUnread(req.user.id, req.body?.arg?.conversationId);
+        return res.status(200).json(result);
+      });
+      return markConvoUnreadHandler;
+    }),
     deleteConvoSharedLinksWithCleanup: jest.fn(),
     deleteAllSharedLinksWithCleanup: jest.fn(),
-    deleteAgentCheckpoints: jest.fn(),
+    deleteAgentCheckpoints,
+    deleteOwnedAgentCheckpoints,
+    openCheckpointDeletion,
+    isConversationImportError: jest.fn((error) => error?.name === 'ConversationImportError'),
     ...overrides,
   }),
 
@@ -125,6 +254,8 @@ module.exports = {
   }),
 
   dataProvider: (overrides = {}) => ({
+    conversationListConfigSchema:
+      jest.requireActual('librechat-data-provider').conversationListConfigSchema,
     CacheKeys: { GEN_TITLE: 'GEN_TITLE' },
     EModelEndpoint: {
       azureAssistants: 'azureAssistants',
@@ -143,6 +274,9 @@ module.exports = {
 
   toolCallModel: () => ({ deleteToolCalls: jest.fn() }),
 
+  /** The list route reads its filter limits from the base config. */
+  appConfig: () => ({ getAppConfig: jest.fn().mockResolvedValue({}) }),
+
   sharedModels: () => ({
     getConvosByCursor: jest.fn(),
     getConvo: jest.fn(),
@@ -150,7 +284,10 @@ module.exports = {
     deleteMessages: jest.fn().mockResolvedValue({ deletedCount: 0 }),
     archiveAllConvos: jest.fn(),
     saveConvo: jest.fn(),
+    getConvoRetention: jest.fn(),
     setConvoPinned: jest.fn(),
+    markConvoSeen: jest.fn(),
+    markConvoUnread: jest.fn(),
     deleteAllSharedLinks: jest.fn(),
     deleteConvoSharedLink: jest.fn(),
     deleteToolCalls: jest.fn(),
@@ -167,11 +304,11 @@ module.exports = {
       forkIpLimiter: (req, res, next) => next(),
       forkUserLimiter: (req, res, next) => next(),
     })),
-    configMiddleware: (req, res, next) => next(),
+    configMiddleware: jest.fn((req, res, next) => next()),
     moderateText,
     messageIpLimiter,
     messageUserLimiter,
-    validateConvoAccess: (req, res, next) => next(),
+    validateConvoAccess: jest.fn((req, res, next) => next()),
   }),
 
   forkUtils: () => ({

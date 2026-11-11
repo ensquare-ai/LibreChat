@@ -2,11 +2,13 @@ import type { Schema, Query, Aggregate } from 'mongoose';
 import type { TenantDocument, TenantUpdate } from '~/tenant/policy';
 import {
   tenantFilter,
+  tenantPartition,
   scopeReplacement,
   currentTenantScope,
   resolveTenantScope,
   stampTenantOnDocument,
   sanitizeTenantMutation,
+  tenantWritePredicate,
   resetTenantStrictCache,
   warnOnInvalidStrictSetting,
 } from '~/tenant/policy';
@@ -26,7 +28,89 @@ export function _resetStrictCache(): void {
 
 warnOnInvalidStrictSetting();
 
+/** Rows of exactly one tenant partition: the active tenant's, or the tenantless ones. */
+export type TenantPartitionFilter =
+  | { tenantId: string }
+  | { $or: [{ tenantId: { $exists: false } }, { tenantId: { $in: [null, ''] } }] };
+
+/**
+ * Mongoose binding of `tenantPartition`, for reads that merge several rows into one answer. The
+ * tenantless form spells out `$exists: false` so it does not lean on `null` also matching a
+ * missing field. Strict mode still refuses a read with no tenant context, as every query does.
+ */
+export function tenantPartitionFilter(operation: string): TenantPartitionFilter {
+  const tenantId = tenantPartition(resolveTenantScope(operation));
+  if (tenantId != null) {
+    return { tenantId };
+  }
+  return { $or: [{ tenantId: { $exists: false } }, { tenantId: { $in: [null, ''] } }] };
+}
+
 const TENANT_ISOLATION_APPLIED = Symbol.for('librechat:tenantIsolation');
+
+interface TenantWhereDocument {
+  $where?: Record<string, unknown>;
+}
+
+interface TenantSaveDocument extends TenantWhereDocument {
+  get(path: string): unknown;
+  set(path: string, value: unknown): void;
+  unmarkModified(path: string): void;
+}
+
+interface TenantWhereState {
+  readonly injectedTenantPredicate: unknown;
+  readonly hadTenantId: boolean;
+  readonly tenantId: unknown;
+}
+
+const tenantWhereStates = new WeakMap<TenantWhereDocument, TenantWhereState>();
+
+interface TenantStampState {
+  readonly injectedTenantId: string;
+  readonly tenantId: unknown;
+}
+
+const tenantStampStates = new WeakMap<TenantSaveDocument, TenantStampState>();
+
+/** Restores the document's own `$where.tenantId` before deriving the next save predicate. */
+function restoreTenantWhere(document: TenantWhereDocument): void {
+  const state = tenantWhereStates.get(document);
+  const where = document.$where;
+  tenantWhereStates.delete(document);
+  if (!state || !where || where.tenantId !== state.injectedTenantPredicate) {
+    return;
+  }
+
+  if (state.hadTenantId) {
+    where.tenantId = state.tenantId;
+    return;
+  }
+
+  const { tenantId: _tenantId, ...rest } = where;
+  document.$where = Object.keys(rest).length > 0 ? rest : undefined;
+}
+
+function applyTenantWhere(document: TenantWhereDocument, tenantPredicate: unknown): void {
+  const where = document.$where;
+  tenantWhereStates.set(document, {
+    injectedTenantPredicate: tenantPredicate,
+    hadTenantId: where != null && Object.prototype.hasOwnProperty.call(where, 'tenantId'),
+    tenantId: where?.tenantId,
+  });
+  document.$where = { ...where, tenantId: tenantPredicate };
+}
+
+/** Rolls back a plugin-owned tenant stamp when the corresponding save fails. */
+function restoreTenantStamp(document: TenantSaveDocument): void {
+  const state = tenantStampStates.get(document);
+  tenantStampStates.delete(document);
+  if (!state || document.get('tenantId') !== state.injectedTenantId) {
+    return;
+  }
+  document.set('tenantId', state.tenantId);
+  document.unmarkModified('tenantId');
+}
 
 /**
  * Mongoose schema plugin that enforces tenant-level data isolation.
@@ -108,7 +192,42 @@ export function applyTenantIsolation(schema: Schema): void {
   });
 
   schema.pre('save', function () {
-    stampTenantOnDocument(resolveTenantScope('Save'), this as unknown as TenantDocument);
+    const scope = resolveTenantScope('Save');
+    const document = this as unknown as TenantSaveDocument;
+    restoreTenantWhere(document);
+    const isNew = this.isNew;
+    const tenantId = this.get('tenantId');
+    const predicate = isNew
+      ? undefined
+      : tenantWritePredicate(scope, this.isModified('tenantId'), tenantId);
+    stampTenantOnDocument(scope, this as unknown as TenantDocument);
+
+    if (isNew) {
+      return;
+    }
+
+    if (scope.kind === 'scoped' && !tenantId) {
+      tenantStampStates.set(document, { injectedTenantId: scope.tenantId, tenantId });
+    }
+
+    /**
+     * `save()` on a persisted document is filtered on `_id` alone, so the
+     * stamped tenant above is never asserted. `$where` is Mongoose's public
+     * hook for adding conditions to that query — its own sharding plugin uses
+     * it the same way. A mismatch surfaces as `DocumentNotFoundError`.
+     */
+    if (predicate) {
+      applyTenantWhere(document, predicate.tenantId);
+    }
+  });
+
+  schema.post('save', function () {
+    tenantStampStates.delete(this as unknown as TenantSaveDocument);
+  });
+
+  schema.post('save', { errorHandler: true }, function (error: Error, _document, next): void {
+    restoreTenantStamp(this as unknown as TenantSaveDocument);
+    next(error);
   });
 
   schema.pre('insertMany', function (next, docs) {

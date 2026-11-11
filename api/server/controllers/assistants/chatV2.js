@@ -5,6 +5,7 @@ const {
   sendEvent,
   countTokens,
   checkBalance,
+  createBalanceReservations,
   getBalanceConfig,
   getTransactionsConfig,
   getModelMaxTokens,
@@ -12,7 +13,13 @@ const {
   isContentFilterError,
   hasActiveFilePolicy,
   preflightAssistantRunContent,
+  reportLocatorTraversalFailure,
   preflightAssistantUserMessageContent,
+  settleAssistantFinal,
+  resolveAssistantProjectTurn,
+  joinChatProjectInstructions,
+  applyForcedTemporaryRequest,
+  getAssistantRun,
 } = require('@librechat/api');
 const {
   Time,
@@ -43,9 +50,11 @@ const {
   getConvo,
   getMultiplier,
   getTransactions,
-  findBalanceByUser,
-  upsertBalanceFields,
-  createAutoRefillTransaction,
+  reserveBalance,
+  renewBalanceReservation,
+  releaseBalanceReservation,
+  getChatProject,
+  getProjectFiles,
   getFiles,
 } = require('~/models');
 const { logViolation, getLogStores } = require('~/cache');
@@ -60,6 +69,7 @@ const { getOpenAIClient } = require('./helpers');
  * @returns {void}
  */
 const chatV2 = async (req, res) => {
+  applyForcedTemporaryRequest(req);
   const appConfig = req.config;
 
   /** @type {{files: MongoFile[]}} */
@@ -113,10 +123,13 @@ const chatV2 = async (req, res) => {
 
   const cache = getLogStores(CacheKeys.ABORT_KEYS);
   const cacheKey = `${req.user.id}:${conversationId}`;
+  /** Registered with the account cleanup barrier by the route, so deletion can stop and drain it. */
+  const assistantRun = getAssistantRun(req);
 
   /** @type {Run | undefined} - The completed run, undefined if incomplete */
   let completedRun;
   let contentRejected = false;
+  const balanceReservations = createBalanceReservations();
 
   const getContext = () => ({
     openai,
@@ -131,14 +144,36 @@ const chatV2 = async (req, res) => {
     responseMessageId,
   });
 
-  const handleError = createErrorHandler({ req, res, getContext });
+  const handleError = assistantRun.guardErrors(res, createErrorHandler({ req, res, getContext }));
 
   try {
-    res.on('close', async () => {
-      if (!completedRun && !contentRejected) {
-        await handleError(new Error('Request closed'));
-      }
-    });
+    res.on(
+      'close',
+      assistantRun.guard(async () => {
+        if (!completedRun && !contentRejected) {
+          await handleError(new Error('Request closed'));
+        }
+      }),
+    );
+    const projectTurn = await resolveAssistantProjectTurn(
+      {
+        userId: req.user.id,
+        tenantId: req.user.tenantId,
+        conversationId: convoId,
+        requestedProjectId: endpointOption?.chatProjectId ?? req.body?.chatProjectId,
+        resolvedConversation: req.resolvedConversation,
+        filters: req.config?.filters,
+      },
+      { getConvo, getChatProject, getProjectFiles },
+    );
+    if (projectTurn.rejection) {
+      contentRejected = true;
+      return res.status(projectTurn.rejection.status).json(projectTurn.rejection.body);
+    }
+    const existingConversation = projectTurn.conversation;
+    const projectInstructions = projectTurn.instructions;
+    req.resolvedConversation = existingConversation;
+    req.chatProjectContext = projectTurn.context;
 
     if (convoId && !_thread_id) {
       completedRun = true;
@@ -166,15 +201,18 @@ const chatV2 = async (req, res) => {
         transactions.reduce((acc, curr) => acc + curr.rawAmount, 0),
       );
 
-      // TODO: make promptBuffer a config option; buffer for titles, needs buffer for system instructions
+      // TODO: make promptBuffer a config option; buffer for title generation.
       const promptBuffer = parentMessageId === Constants.NO_PARENT && !_thread_id ? 200 : 0;
       // 5 is added for labels
-      let promptTokens = (await countTokens(text + (promptPrefix ?? ''))) + 5;
-      promptTokens += totalPreviousTokens + promptBuffer;
+      const promptText = joinChatProjectInstructions(
+        `${text ?? ''}${promptPrefix ?? ''}`,
+        projectInstructions,
+      );
+      let promptTokens = totalPreviousTokens + (await countTokens(promptText)) + 5 + promptBuffer;
       // Count tokens up to the current context window
       promptTokens = Math.min(promptTokens, getModelMaxTokens(model));
 
-      await checkBalance(
+      return await checkBalance(
         {
           req,
           res,
@@ -186,12 +224,12 @@ const chatV2 = async (req, res) => {
           },
         },
         {
-          findBalanceByUser,
           getMultiplier,
-          createAutoRefillTransaction,
+          reserveBalance,
+          renewBalanceReservation,
+          releaseBalanceReservation,
           logViolation,
           balanceConfig,
-          upsertBalanceFields,
         },
       );
     };
@@ -206,6 +244,7 @@ const chatV2 = async (req, res) => {
     await validateAuthor({ req, openai });
     try {
       await preflightAssistantRunContent({
+        onTraversalFailure: reportLocatorTraversalFailure,
         config: req.config,
         openai,
         user: req.user,
@@ -251,20 +290,17 @@ const chatV2 = async (req, res) => {
       endpointOption,
       clientTimestamp,
     });
-
-    let existingConversationPromise;
-    const getExistingConversation = () => {
-      if (!convoId) {
-        return Promise.resolve(null);
-      }
-      existingConversationPromise ??= getConvo(req.user.id, convoId);
-      return existingConversationPromise;
-    };
+    if (projectInstructions) {
+      body.additional_instructions = joinChatProjectInstructions(
+        body.additional_instructions,
+        projectInstructions,
+      );
+    }
 
     const getRequestFileIds = async () => {
       let thread_file_ids = [];
       if (convoId) {
-        const convo = await getExistingConversation();
+        const convo = existingConversation;
         if (convo && convo.file_ids) {
           thread_file_ids = convo.file_ids;
         }
@@ -357,8 +393,9 @@ const chatV2 = async (req, res) => {
       previousMessages.push(requestMessage);
 
       /* asynchronous */
-      userMessagePromise = saveUserMessage(req, { ...requestMessage, model });
+      userMessagePromise = assistantRun.track(saveUserMessage(req, { ...requestMessage, model }));
 
+      const conversationProjectId = projectTurn.membershipProjectId;
       conversation = {
         conversationId,
         endpoint,
@@ -366,6 +403,7 @@ const chatV2 = async (req, res) => {
         instructions: instructions,
         assistant_id,
         // model,
+        ...(conversationProjectId !== undefined ? { chatProjectId: conversationProjectId } : {}),
       };
 
       if (file_ids.length) {
@@ -377,6 +415,7 @@ const chatV2 = async (req, res) => {
       await getRequestFileIds();
       try {
         await preflightAssistantUserMessageContent({
+          onTraversalFailure: reportLocatorTraversalFailure,
           config: req.config,
           user: req.user,
           message: userMessage,
@@ -392,7 +431,10 @@ const chatV2 = async (req, res) => {
       }
     }
 
-    const promises = [initializeThread(), checkBalanceBeforeRun()];
+    const promises = [
+      assistantRun.track(initializeThread()),
+      balanceReservations.track(checkBalanceBeforeRun()),
+    ];
     await Promise.all(promises);
 
     const sendInitialResponse = () => {
@@ -441,6 +483,7 @@ const chatV2 = async (req, res) => {
         });
 
         run_id = run.id;
+        assistantRun.cancelOnStop(openai, { thread_id, run_id });
         await cache.set(cacheKey, `${thread_id}:${run_id}`, Time.TEN_MINUTES);
         sendInitialResponse();
 
@@ -454,6 +497,7 @@ const chatV2 = async (req, res) => {
         [AssistantStreamEvents.ThreadRunCreated]: async (event) => {
           await cache.set(cacheKey, `${thread_id}:${event.data.id}`, Time.TEN_MINUTES);
           run_id = event.data.id;
+          assistantRun.cancelOnStop(openai, { thread_id, run_id });
           sendInitialResponse();
         },
       };
@@ -489,6 +533,7 @@ const chatV2 = async (req, res) => {
 
     try {
       await preflightAssistantRunContent({
+        onTraversalFailure: reportLocatorTraversalFailure,
         config: req.config,
         openai,
         user: req.user,
@@ -503,6 +548,7 @@ const chatV2 = async (req, res) => {
       contentRejected = true;
       return res.status(error.statusCode).json(error.body);
     }
+    assistantRun.throwIfStopped();
     setHeaders(req, res, () => {});
     await processRun();
     logger.debug('[/assistants/chat/] response', {
@@ -516,7 +562,7 @@ const chatV2 = async (req, res) => {
     }
 
     if (response.run.status === RunStatus.IN_PROGRESS) {
-      processRun(true);
+      balanceReservations.holdUntil(processRun(true));
     }
 
     completedRun = response.run;
@@ -536,20 +582,23 @@ const chatV2 = async (req, res) => {
       iconURL: endpointOption.iconURL,
     };
 
+    if (userMessagePromise) {
+      await userMessagePromise;
+    }
+
+    const settledConversation = await settleAssistantFinal(() =>
+      saveAssistantMessage(req, { ...responseMessage, model }),
+    );
+
     sendEvent(res, {
       final: true,
-      conversation,
+      conversation: { ...conversation, ...settledConversation },
       requestMessage: {
         parentMessageId,
         thread_id,
       },
     });
     res.end();
-
-    if (userMessagePromise) {
-      await userMessagePromise;
-    }
-    await saveAssistantMessage(req, { ...responseMessage, model });
 
     if (parentMessageId === Constants.NO_PARENT && !_thread_id) {
       addTitle(req, {
@@ -589,6 +638,8 @@ const chatV2 = async (req, res) => {
     }
   } catch (error) {
     await handleError(error);
+  } finally {
+    await balanceReservations.release();
   }
 };
 

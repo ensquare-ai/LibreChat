@@ -3,8 +3,10 @@ const express = require('express');
 const {
   assertModelBoundContent,
   createShareContentPreflight,
+  reportLocatorTraversalFailure,
   isEnabled,
   isContentFilterError,
+  isConversationImportError,
   generateCheckAccess,
   grantCreationPermissions,
   ensureLinkPermissions,
@@ -23,12 +25,14 @@ const {
   createSharedLangfuseSessionResolver,
   recordShareLinkRejection,
   traceIdForMessage,
+  resolveDownloadPath,
+  prepareResultToolCallPreviews,
 } = require('@librechat/api');
 const {
   logger,
   runAsSystem,
   tenantStorage,
-  createTempChatExpirationDate,
+  createChatExpirationDate,
 } = require('@librechat/data-schemas');
 const { FileSources, PermissionTypes, Permissions } = require('librechat-data-provider');
 const {
@@ -57,6 +61,10 @@ const configMiddleware = require('~/server/middleware/config/app');
 const { getAppConfig } = require('~/server/services/Config/app');
 const router = express.Router();
 const sharedLinkConfigMiddleware = createSharedLinkConfigMiddleware({ getAppConfig });
+const sharedStartupConfigMiddleware = createSharedLinkConfigMiddleware({
+  getAppConfig,
+  failClosed: true,
+});
 
 const getSharedLangfuseSessionUrl = createSharedLangfuseSessionResolver({
   getHeldCapabilities,
@@ -116,7 +124,7 @@ const resolveSharedLinkExpiration = (req, conversationId) =>
           'isTemporary expiredAt',
         ).lean();
       },
-      createExpirationDate: createTempChatExpirationDate,
+      createExpirationDate: createChatExpirationDate,
       logger,
     },
   );
@@ -138,6 +146,7 @@ const PREVIEW_LAZY_SWEEP_CUTOFF_MS = 2 * 60 * 1000;
 const enforceSharedFileContentPolicy = (req, res, next) => {
   try {
     assertModelBoundContent({
+      onTraversalFailure: reportLocatorTraversalFailure,
       filters: req.config?.filters,
       files: [req.liveFile],
     });
@@ -296,7 +305,7 @@ const streamSharedFile = async (req, res, file, requestedDisposition) => {
 
   // Strip any cache-busting query string (e.g. code-output images add `?v=...`) so
   // the local stream resolves the real filename, not a literal `*.png?v=...` path.
-  const streamPath = (file.storageKey || file.filepath || '').split('?')[0];
+  const streamPath = (resolveDownloadPath(file) || '').split('?')[0];
   const fileStream = await getDownloadStream(req, streamPath);
 
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -342,7 +351,7 @@ if (allowSharedLinks) {
     '/:shareId/config',
     optionalJwtAuth,
     canAccessSharedLink,
-    sharedLinkConfigMiddleware,
+    sharedStartupConfigMiddleware,
     (req, res) => {
       try {
         const payload = buildSharedLinkStartupPayload(req.config);
@@ -365,6 +374,7 @@ if (allowSharedLinks) {
     async (req, res) => {
       try {
         const contentPreflight = createShareContentPreflight(req.config?.filters, {
+          onTraversalFailure: reportLocatorTraversalFailure,
           sharedFileMetadata: true,
           legacyPii: req.config?.messageFilter?.pii,
         });
@@ -415,6 +425,7 @@ if (allowSharedLinks) {
     sharedLinkConfigMiddleware,
     async (req, res) => {
       try {
+        const previewToolCalls = prepareResultToolCallPreviews(req, { getAppConfig });
         const result = await forkSharedConversation({
           shareId: req.params.shareId,
           shareResourceId: req.shareResourceId,
@@ -427,6 +438,7 @@ if (allowSharedLinks) {
           // the GET share route so disabled file snapshots aren't copied into forks.
           snapshotFiles: !isFileSnapshotKillSwitchActive(),
           sharedContentPreflight: createShareContentPreflight(req.config?.filters, {
+            onTraversalFailure: reportLocatorTraversalFailure,
             sharedFileMetadata: true,
             legacyPii: req.config?.messageFilter?.pii,
           }),
@@ -434,9 +446,12 @@ if (allowSharedLinks) {
         if (!result) {
           return res.status(404).json({ message: 'Shared conversation not found' });
         }
-        return res.status(201).json(result);
+        return res.status(201).json(await previewToolCalls(result));
       } catch (error) {
         if (isContentFilterError(error)) {
+          return res.status(error.statusCode).json(error.body);
+        }
+        if (isConversationImportError(error)) {
           return res.status(error.statusCode).json(error.body);
         }
         if (error?.code !== 'SHARE_REVISION_MISMATCH') {
@@ -648,6 +663,7 @@ router.post(
       // did not uncheck "share files" (body flag absent defaults to enabled).
       const snapshotFiles = isFileSnapshotEnabled(req.config) && requestedSnapshotFiles !== false;
       const contentPreflight = createShareContentPreflight(req.config?.filters, {
+        onTraversalFailure: reportLocatorTraversalFailure,
         snapshotFiles,
         user: req.user,
         getFiles,
@@ -718,6 +734,7 @@ router.patch(
 
       const snapshotFiles = isFileSnapshotEnabled(req.config) && requestedSnapshotFiles !== false;
       const contentPreflight = createShareContentPreflight(req.config?.filters, {
+        onTraversalFailure: reportLocatorTraversalFailure,
         snapshotFiles,
         user: req.user,
         getFiles,

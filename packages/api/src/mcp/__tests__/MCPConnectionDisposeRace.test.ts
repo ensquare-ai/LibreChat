@@ -10,7 +10,10 @@
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  ListToolsRequestSchema,
+  InitializeRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 import { MCPConnection } from '~/mcp/connection';
 
 jest.setTimeout(10_000);
@@ -37,6 +40,52 @@ describe('MCPConnection disposal during connect', () => {
   afterEach(async () => {
     await server?.close().catch(() => undefined);
     server = undefined;
+  });
+
+  it('does not charge a disposed initialize attempt to connection health', async () => {
+    server = new Server({ name: 'cancelled-initialize', version: '1.0.0' }, { capabilities: {} });
+    let started: (() => void) | undefined;
+    const initializeStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let finish: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    server.setRequestHandler(InitializeRequestSchema, async (request) => {
+      started?.();
+      await gate;
+      return {
+        protocolVersion: request.params.protocolVersion,
+        capabilities: {},
+        serverInfo: { name: 'cancelled-initialize', version: '1.0.0' },
+      };
+    });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    const connection = new MCPConnection({
+      serverName: 'cancelled-initialize',
+      serverConfig: { type: 'streamable-http', url: 'http://localhost/mcp' },
+      useSSRFProtection: false,
+      directBearerRecoveryEnabled: true,
+    });
+    jest
+      .spyOn(
+        connection as unknown as { constructTransport: () => Promise<unknown> },
+        'constructTransport',
+      )
+      .mockResolvedValue(clientTransport);
+    const recordFailedRound = jest.spyOn(
+      connection as unknown as { recordFailedRound: () => void },
+      'recordFailedRound',
+    );
+    const connecting = connection.connectClient().catch((error: Error) => error);
+    await initializeStarted;
+    await connection.dispose();
+    finish?.();
+    await connecting;
+    expect(recordFailedRound).not.toHaveBeenCalled();
+    expect(await connection.isConnected()).toBe(false);
   });
 
   it('leaves no live session when disposal lands while the transport is being constructed', async () => {
@@ -85,4 +134,46 @@ describe('MCPConnection disposal during connect', () => {
     expect(await connection.isConnected()).toBe(false);
     expect(serverSawClose).toBe(true);
   });
+});
+
+it('detaches a noncooperative header resolver on disposal without retiring another connection', async () => {
+  let release!: () => void;
+  const stalled = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const signals: AbortSignal[] = [];
+  const headers = jest.fn(async (signal?: AbortSignal) => {
+    signals.push(signal!);
+    await stalled;
+    return { authorization: 'Bearer waiter-only' };
+  });
+  const first = new MCPConnection({
+    serverName: 'local-first',
+    serverConfig: { type: 'streamable-http', url: 'https://resource.example/mcp' },
+    resolveRequestHeaders: headers,
+  });
+  const second = new MCPConnection({
+    serverName: 'local-second',
+    serverConfig: { type: 'streamable-http', url: 'https://resource.example/mcp' },
+    resolveRequestHeaders: headers,
+  });
+  const rejected = first['trackRequest'](() => first['authorizeRequestHeaders']()).catch(
+    (error) => error,
+  );
+  const sibling = second['trackRequest'](() => second['authorizeRequestHeaders']());
+  try {
+    await first.dispose();
+    await expect(rejected).resolves.toMatchObject({ name: 'AbortError' });
+    expect(signals[0].aborted).toBe(true);
+    expect(signals[1].aborted).toBe(false);
+    release();
+    await expect(sibling).resolves.toEqual({ authorization: 'Bearer waiter-only' });
+    expect(Reflect.get(first, 'pendingRequests').size).toBe(0);
+  } finally {
+    release();
+    await rejected;
+    await sibling;
+    await first.dispose();
+    await second.dispose();
+  }
 });

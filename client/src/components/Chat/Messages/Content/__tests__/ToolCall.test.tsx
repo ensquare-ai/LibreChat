@@ -1,9 +1,18 @@
 import React from 'react';
 import { RecoilRoot } from 'recoil';
-import { Tools, Constants } from 'librechat-data-provider';
-import { render, screen, fireEvent } from '@testing-library/react';
-import { ToolAuthWarningContext } from '../auth';
+import { ToolAuthWarningContext } from '@librechat/chat/components';
+import { Tools, Constants, dataService } from 'librechat-data-provider';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import {
+  LoneGroupContext,
+  SoleToolContext,
+  GeneratedToolLabelContext,
+} from '@librechat/chat/react';
+import type { TStartupConfig } from 'librechat-data-provider';
+import { MCPAppsPolicyProvider } from '~/Providers/MCPAppsPolicyContext';
 import ToolCall from '../ToolCall';
+import { logger } from '~/utils';
+import store from '~/store';
 
 // Mock dependencies
 jest.mock('~/hooks', () => ({
@@ -14,6 +23,8 @@ jest.mock('~/hooks', () => ({
       com_assistants_completed_action: `Completed action on ${values?.[0]}`,
       com_assistants_running_var: `Running ${values?.[0]}`,
       com_assistants_running_action: 'Running action',
+      com_ui_tool_preparing: `Preparing ${values?.[0]}`,
+      com_ui_tool_calling: `Calling ${values?.[0]}`,
       com_ui_sign_in_to_domain: `Sign in to ${values?.[0]}`,
       com_ui_cancelled: 'Cancelled',
       com_ui_requires_auth: 'Requires authentication',
@@ -24,7 +35,10 @@ jest.mock('~/hooks', () => ({
     };
     return translations[key] || key;
   },
-  useProgress: (initialProgress: number) => (initialProgress >= 1 ? 1 : initialProgress),
+}));
+
+jest.mock('@librechat/chat/components', () => ({
+  ...jest.requireActual('@librechat/chat/components'),
   useExpandCollapse: (isExpanded: boolean) => ({
     style: {
       display: 'grid',
@@ -33,13 +47,19 @@ jest.mock('~/hooks', () => ({
     },
     ref: { current: null },
   }),
-  useLazyCollapseBody: jest.requireActual('~/hooks/Messages/useLazyCollapseBody').default,
+}));
+
+jest.mock('@librechat/chat/react', () => ({
+  ...jest.requireActual('@librechat/chat/react'),
+  useProgress: (initialProgress: number) => (initialProgress >= 1 ? 1 : initialProgress),
 }));
 
 jest.mock('~/hooks/MCP', () => {
   const mcpServerNames: string[] = [];
   return {
     useMCPIconMap: () => new Map(),
+    useAppBridge: jest.fn(),
+    useMCPAppFrame: jest.requireActual('~/hooks/MCP/useMCPAppFrame').useMCPAppFrame,
     useMCPServerNames: () => mcpServerNames,
   };
 });
@@ -84,18 +104,42 @@ jest.mock('../Parts', () => ({
   ),
 }));
 
-jest.mock('@librechat/client', () => ({
-  Button: ({ children, onClick, ...props }: any) => (
-    <button onClick={onClick} {...props}>
-      {children}
-    </button>
-  ),
-}));
+jest.mock('@librechat/client', () => {
+  const actual = jest.requireActual('@librechat/client');
+  const DialogPart = ({ children }: { children?: React.ReactNode }) => <div>{children}</div>;
+  const DialogButton = ({
+    children,
+    onClick,
+  }: {
+    children?: React.ReactNode;
+    onClick?: () => void;
+  }) => <button onClick={onClick}>{children}</button>;
+  return {
+    cn: actual.cn,
+    useLocalize: () => jest.requireMock('~/hooks').useLocalize(),
+    Button: ({ children, onClick, ...props }: any) => (
+      <button onClick={onClick} {...props}>
+        {children}
+      </button>
+    ),
+    Spinner: (props: React.HTMLAttributes<HTMLSpanElement>) => <span {...props} />,
+    AlertDialog: ({ children, open }: { children?: React.ReactNode; open: boolean }) =>
+      open ? <div>{children}</div> : null,
+    AlertDialogContent: DialogPart,
+    AlertDialogHeader: DialogPart,
+    AlertDialogTitle: DialogPart,
+    AlertDialogDescription: DialogPart,
+    AlertDialogFooter: DialogPart,
+    AlertDialogAction: DialogButton,
+    AlertDialogCancel: DialogButton,
+  };
+});
 
 jest.mock('lucide-react', () => ({
   ChevronDown: () => <span>{'ChevronDown'}</span>,
   ChevronUp: () => <span>{'ChevronUp'}</span>,
   TriangleAlert: () => <span>{'TriangleAlert'}</span>,
+  CircleX: () => <span>{'CircleX'}</span>,
 }));
 
 jest.mock('~/utils', () => ({
@@ -105,9 +149,23 @@ jest.mock('~/utils', () => ({
   cn: (...classes: any[]) => classes.filter(Boolean).join(' '),
   getToolDisplayLabel: (name: string, localize: (key: string) => string) =>
     name === 'set_memory' ? localize('com_ui_tool_name_set_memory') : name,
+  openInNewTab: jest.requireActual('~/utils/links').openInNewTab,
 }));
 
+jest.mock('librechat-data-provider', () => {
+  const actual = jest.requireActual('librechat-data-provider');
+  return {
+    ...actual,
+    dataService: {
+      ...actual.dataService,
+      bindMCPOAuth: jest.fn(),
+      bindActionOAuth: jest.fn(),
+    },
+  };
+});
+
 describe('ToolCall', () => {
+  const originalSandboxUrl = process.env.VITE_MCP_SANDBOX_URL;
   const mockProps = {
     args: '{"test": "input"}',
     name: 'testFunction',
@@ -116,12 +174,50 @@ describe('ToolCall', () => {
     isSubmitting: false,
   };
 
-  const renderWithRecoil = (component: React.ReactElement) => {
-    return render(<RecoilRoot>{component}</RecoilRoot>);
+  const renderWithRecoil = (
+    component: React.ReactElement,
+    mcpApps = { enabled: true, legacyHtmlEnabled: true },
+  ) => {
+    return render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider startupConfig={{ mcpApps } as TStartupConfig} ready userId="user-1">
+          {component}
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
   };
 
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.VITE_MCP_SANDBOX_URL = 'http://sandbox.localhost:3081/api/mcp/sandbox';
+  });
+
+  afterAll(() => {
+    if (originalSandboxUrl == null) {
+      delete process.env.VITE_MCP_SANDBOX_URL;
+    } else {
+      process.env.VITE_MCP_SANDBOX_URL = originalSandboxUrl;
+    }
+  });
+
+  describe('tool preparation feedback', () => {
+    it('announces preparation and then execution without calling the tool during argument streaming', () => {
+      const props = {
+        ...mockProps,
+        output: null,
+        initialProgress: 0.1,
+        isSubmitting: true,
+        toolPreparationStartedAt: 1_000,
+      };
+      const { rerender } = renderWithRecoil(<ToolCall {...props} />);
+      expect(screen.getByText('Preparing testFunction')).toBeInTheDocument();
+      rerender(
+        <RecoilRoot>
+          <ToolCall {...props} toolDispatchedAt={4_000} />
+        </RecoilRoot>,
+      );
+      expect(screen.getByText('Calling testFunction')).toBeInTheDocument();
+    });
   });
 
   describe('intent label', () => {
@@ -141,7 +237,7 @@ describe('ToolCall', () => {
       /** The aria-live region keeps its STABLE generic value while the intent
        *  streams — an atomic polite region would otherwise re-announce the
        *  whole growing sentence on every delta. */
-      expect(screen.getByText('Running testFunction')).toBeInTheDocument();
+      expect(screen.getByText('Preparing testFunction')).toBeInTheDocument();
     });
 
     it('keeps the intent as the settled label instead of the generic completion text', () => {
@@ -189,26 +285,24 @@ describe('ToolCall', () => {
 
       renderWithRecoil(<ToolCall {...mockProps} attachments={attachments as any} />);
 
+      expect(screen.getByTestId('attachment-group')).toBeInTheDocument();
+
       fireEvent.click(screen.getByTestId('progress-text'));
 
-      const toolCallInfo = screen.getByTestId('tool-call-info');
-      expect(toolCallInfo).toBeInTheDocument();
-
-      const attachmentsData = toolCallInfo.getAttribute('data-attachments');
-      expect(attachmentsData).toBe(JSON.stringify(attachments));
+      expect(screen.getByTestId('tool-call-info')).toBeInTheDocument();
     });
 
-    it('should pass empty array when no attachments', () => {
+    it('should render ToolCallInfo without attachment-group when no attachments', () => {
       renderWithRecoil(<ToolCall {...mockProps} />);
 
+      expect(screen.queryByTestId('attachment-group')).not.toBeInTheDocument();
+
       fireEvent.click(screen.getByTestId('progress-text'));
 
-      const toolCallInfo = screen.getByTestId('tool-call-info');
-      const attachmentsData = toolCallInfo.getAttribute('data-attachments');
-      expect(attachmentsData).toBeNull(); // JSON.stringify(undefined) returns undefined, so attribute is not set
+      expect(screen.getByTestId('tool-call-info')).toBeInTheDocument();
     });
 
-    it('should pass multiple attachments of different types', () => {
+    it('should render AttachmentGroup with all attachments of mixed types', () => {
       const attachments = [
         {
           type: Tools.ui_resources,
@@ -232,11 +326,130 @@ describe('ToolCall', () => {
 
       renderWithRecoil(<ToolCall {...mockProps} attachments={attachments as any} />);
 
-      fireEvent.click(screen.getByTestId('progress-text'));
+      const attachmentGroup = screen.getByTestId('attachment-group');
+      expect(JSON.parse(attachmentGroup.textContent!)).toEqual(attachments);
+    });
 
-      const toolCallInfo = screen.getByTestId('tool-call-info');
-      const attachmentsData = toolCallInfo.getAttribute('data-attachments');
-      expect(JSON.parse(attachmentsData!)).toEqual(attachments);
+    it('renders an iframe for an inline ui:// text resource attached to the tool call', () => {
+      const attachments = [
+        {
+          type: Tools.ui_resources,
+          messageId: 'msg1',
+          toolCallId: 'tool1',
+          conversationId: 'conv1',
+          [Tools.ui_resources]: [
+            {
+              uri: 'ui://test-server/inline.html',
+              mimeType: 'text/html;profile=mcp-app',
+              text: '<p>inline resource</p>',
+              resourceId: 'inline-1',
+              toolName: 'test-tool',
+              serverName: 'test-server',
+              toolArgs: { owner: 'resource' },
+              content: [{ type: 'text', text: 'resource result' }],
+              structuredContent: { owner: 'resource' },
+            },
+          ],
+        },
+      ];
+
+      const { container } = renderWithRecoil(
+        <ToolCall
+          {...mockProps}
+          args={{ owner: 'enclosing leaf' }}
+          attachments={attachments as any}
+        />,
+      );
+
+      // Stored results do not run App code until the viewer explicitly opens the App.
+      expect(container.querySelector('iframe[data-sandbox-url]')).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /com_ui_mcp_app_open_named/ }));
+      const iframe = container.querySelector('iframe[data-sandbox-url]');
+      expect(iframe).toBeInTheDocument();
+      const { useAppBridge } = jest.requireMock('~/hooks/MCP') as { useAppBridge: jest.Mock };
+      expect(useAppBridge).toHaveBeenCalledWith(
+        expect.objectContaining({
+          toolArgs: { owner: 'resource' },
+          toolResult: expect.objectContaining({
+            content: [{ type: 'text', text: 'resource result' }],
+            structuredContent: { owner: 'resource' },
+          }),
+        }),
+      );
+    });
+
+    it('keeps ordinary tool content but does not mount a stored App while disabled', () => {
+      const attachments = [
+        {
+          type: Tools.ui_resources,
+          [Tools.ui_resources]: [
+            {
+              uri: 'ui://test-server/stored.html',
+              mimeType: 'text/html;profile=mcp-app',
+              text: '<p>stored app</p>',
+              resourceId: 'stored-app',
+              toolName: 'test-tool',
+              serverName: 'test-server',
+            },
+          ],
+        },
+      ];
+
+      const { container } = renderWithRecoil(
+        <ToolCall {...mockProps} attachments={attachments as never} />,
+        { enabled: false, legacyHtmlEnabled: false },
+      );
+
+      expect(screen.getAllByText('Completed testFunction').length).toBeGreaterThan(0);
+      expect(container.querySelector('iframe[data-sandbox-url]')).not.toBeInTheDocument();
+      const { useAppBridge } = jest.requireMock('~/hooks/MCP') as { useAppBridge: jest.Mock };
+      expect(useAppBridge).not.toHaveBeenCalled();
+    });
+
+    it('removes a mounted App when the observed policy is disabled', () => {
+      const attachments = [
+        {
+          type: Tools.ui_resources,
+          [Tools.ui_resources]: [
+            {
+              uri: 'ui://test-server/live.html',
+              mimeType: 'text/html;profile=mcp-app',
+              text: '<p>live app</p>',
+              resourceId: 'live-app',
+              toolName: 'test-tool',
+              serverName: 'test-server',
+            },
+          ],
+        },
+      ];
+      const enabledConfig = {
+        mcpApps: { enabled: true, legacyHtmlEnabled: true },
+      } as TStartupConfig;
+      const disabledConfig = {
+        mcpApps: { enabled: false, legacyHtmlEnabled: false },
+      } as TStartupConfig;
+      const toolCall = <ToolCall {...mockProps} attachments={attachments as never} />;
+      const { container, rerender } = render(
+        <RecoilRoot>
+          <MCPAppsPolicyProvider startupConfig={enabledConfig} ready userId="user-1">
+            {toolCall}
+          </MCPAppsPolicyProvider>
+        </RecoilRoot>,
+      );
+      expect(container.querySelector('iframe[data-sandbox-url]')).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole('button', { name: /com_ui_mcp_app_open_named/ }));
+      expect(container.querySelector('iframe[data-sandbox-url]')).toBeInTheDocument();
+
+      rerender(
+        <RecoilRoot>
+          <MCPAppsPolicyProvider startupConfig={disabledConfig} ready userId="user-1">
+            {toolCall}
+          </MCPAppsPolicyProvider>
+        </RecoilRoot>,
+      );
+
+      expect(container.querySelector('iframe[data-sandbox-url]')).not.toBeInTheDocument();
+      expect(screen.getAllByText('Completed testFunction').length).toBeGreaterThan(0);
     });
   });
 
@@ -291,6 +504,32 @@ describe('ToolCall', () => {
       expect(screen.queryByTestId('attachment-group')).not.toBeInTheDocument();
     });
 
+    it('does not mount an App when a parent attachment owner hides the leaf output', () => {
+      const attachments = [
+        {
+          type: Tools.ui_resources,
+          [Tools.ui_resources]: [
+            {
+              resourceId: 'hidden-app',
+              uri: 'ui://demo/hidden',
+              mimeType: 'text/html;profile=mcp-app',
+              toolName: 'show_app',
+              serverName: 'demo',
+              text: '<p>Hidden App</p>',
+            },
+          ],
+        },
+      ];
+
+      const { container } = renderWithRecoil(
+        <ToolCall {...mockProps} attachments={attachments as never} hideAttachments />,
+      );
+
+      expect(container.querySelector('iframe[data-sandbox-url]')).not.toBeInTheDocument();
+      const { useAppBridge } = jest.requireMock('~/hooks/MCP') as { useAppBridge: jest.Mock };
+      expect(useAppBridge).not.toHaveBeenCalled();
+    });
+
     it('should render AttachmentGroup when hideAttachments is false explicitly', () => {
       const attachments = [
         {
@@ -335,8 +574,10 @@ describe('ToolCall', () => {
 
   describe('authentication flow', () => {
     it('should show sign-in button when auth URL is provided', () => {
-      const originalOpen = window.open;
-      window.open = jest.fn();
+      const open = jest.spyOn(window, 'open').mockImplementation(() => null);
+      const click = jest
+        .spyOn(HTMLAnchorElement.prototype, 'click')
+        .mockImplementation(() => undefined);
 
       renderWithRecoil(
         <ToolCall
@@ -351,13 +592,122 @@ describe('ToolCall', () => {
       expect(signInButton).toBeInTheDocument();
 
       fireEvent.click(signInButton);
-      expect(window.open).toHaveBeenCalledWith(
-        'https://auth.example.com',
-        '_blank',
-        'noopener,noreferrer',
-      );
+      expect(click).toHaveBeenCalledTimes(1);
+      const link = click.mock.instances[0] as unknown as HTMLAnchorElement;
+      expect(link.href).toBe('https://auth.example.com/');
+      expect(link.target).toBe('_blank');
+      expect(link.rel).toBe('noopener noreferrer');
+      /** A features string makes WebKit request a popup window, which iOS web apps cannot open. */
+      expect(open).not.toHaveBeenCalled();
 
-      window.open = originalOpen;
+      click.mockRestore();
+      open.mockRestore();
+    });
+
+    describe('MCP sign-in', () => {
+      const callbackUrl = 'https://chat.example.com/api/mcp/clickhouse/oauth/callback';
+      const mcpAuth = `https://mcp.example.com/authorize?redirect_uri=${encodeURIComponent(callbackUrl)}`;
+      const mcpProps = {
+        ...mockProps,
+        name: `oauth${Constants.mcp_delimiter}clickhouse`,
+        auth: mcpAuth,
+        initialProgress: 0.5,
+        isSubmitting: true,
+      };
+      let click: jest.SpyInstance;
+
+      beforeEach(() => {
+        click = jest
+          .spyOn(HTMLAnchorElement.prototype, 'click')
+          .mockImplementation(() => undefined);
+      });
+
+      afterEach(() => {
+        click.mockRestore();
+      });
+
+      const signInButton = () => screen.getByRole('button', { name: 'Sign in to mcp.example.com' });
+
+      it('binds when the prompt appears and opens the provider within the tap', async () => {
+        (dataService.bindMCPOAuth as jest.Mock).mockResolvedValue({ success: true });
+        renderWithRecoil(<ToolCall {...mcpProps} />);
+        expect(dataService.bindMCPOAuth).toHaveBeenCalledWith('clickhouse');
+        await waitFor(() => expect(signInButton()).toBeEnabled());
+
+        fireEvent.click(signInButton());
+
+        expect(click).toHaveBeenCalledTimes(1);
+        expect((click.mock.instances[0] as unknown as HTMLAnchorElement).href).toBe(mcpAuth);
+        expect(dataService.bindMCPOAuth).toHaveBeenCalledTimes(2);
+        expect(dataService.bindMCPOAuth).toHaveBeenLastCalledWith('clickhouse');
+      });
+
+      it('claims the shared CSRF binding for the prompt the user taps', async () => {
+        (dataService.bindMCPOAuth as jest.Mock).mockResolvedValue({ success: true });
+        const notionCallback = 'https://chat.example.com/api/mcp/notion/oauth/callback';
+        const notionAuth = `https://notion.example.com/authorize?redirect_uri=${encodeURIComponent(notionCallback)}`;
+        const notionButton = () =>
+          screen.getByRole('button', { name: 'Sign in to notion.example.com' });
+        renderWithRecoil(
+          <>
+            <ToolCall {...mcpProps} />
+            <ToolCall
+              {...mcpProps}
+              name={`oauth${Constants.mcp_delimiter}notion`}
+              auth={notionAuth}
+            />
+          </>,
+        );
+        await waitFor(() => expect(signInButton()).toBeEnabled());
+        await waitFor(() => expect(notionButton()).toBeEnabled());
+        expect(dataService.bindMCPOAuth).toHaveBeenLastCalledWith('notion');
+
+        fireEvent.click(signInButton());
+
+        expect(click).toHaveBeenCalledTimes(1);
+        expect((click.mock.instances[0] as unknown as HTMLAnchorElement).href).toBe(mcpAuth);
+        expect(dataService.bindMCPOAuth).toHaveBeenLastCalledWith('clickhouse');
+      });
+
+      it('keeps sign-in disabled until the bind lands', async () => {
+        let finishBind: (() => void) | undefined;
+        (dataService.bindMCPOAuth as jest.Mock).mockReturnValue(
+          new Promise((resolve) => {
+            finishBind = () => resolve({ success: true });
+          }),
+        );
+        renderWithRecoil(<ToolCall {...mcpProps} />);
+
+        expect(signInButton()).toBeDisabled();
+        expect(signInButton()).toHaveAttribute('aria-busy', 'true');
+        fireEvent.click(signInButton());
+        expect(click).not.toHaveBeenCalled();
+
+        finishBind!();
+        await waitFor(() => expect(signInButton()).toBeEnabled());
+        fireEvent.click(signInButton());
+        expect(click).toHaveBeenCalledTimes(1);
+      });
+
+      it('retries a failed bind on tap instead of opening the provider', async () => {
+        (dataService.bindMCPOAuth as jest.Mock)
+          .mockRejectedValueOnce(new Error('bind failed'))
+          .mockResolvedValue({ success: true });
+        renderWithRecoil(<ToolCall {...mcpProps} />);
+        await waitFor(() => expect(logger.error).toHaveBeenCalled());
+        await waitFor(() => expect(signInButton()).toBeEnabled());
+
+        fireEvent.click(signInButton());
+
+        expect(click).not.toHaveBeenCalled();
+        expect(screen.getByRole('alert')).toHaveTextContent('com_ui_oauth_error_generic');
+        await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+        expect(dataService.bindMCPOAuth).toHaveBeenCalledTimes(2);
+        await waitFor(() => expect(signInButton()).toBeEnabled());
+
+        fireEvent.click(signInButton());
+        expect(click).toHaveBeenCalledTimes(1);
+      });
     });
 
     it('should not show auth section when cancelled', () => {
@@ -413,7 +763,7 @@ describe('ToolCall', () => {
       expect(screen.getByTestId('tool-call-info')).toBeInTheDocument();
     });
 
-    it('should handle complex nested attachments', () => {
+    it('should render AttachmentGroup with complex nested attachments', () => {
       const complexAttachments = [
         {
           type: Tools.ui_resources,
@@ -436,12 +786,6 @@ describe('ToolCall', () => {
       ];
 
       renderWithRecoil(<ToolCall {...mockProps} attachments={complexAttachments as any} />);
-
-      fireEvent.click(screen.getByTestId('progress-text'));
-
-      const toolCallInfo = screen.getByTestId('tool-call-info');
-      const attachmentsData = toolCallInfo.getAttribute('data-attachments');
-      expect(JSON.parse(attachmentsData!)).toEqual(complexAttachments);
 
       const attachmentGroup = screen.getByTestId('attachment-group');
       expect(JSON.parse(attachmentGroup.textContent!)).toEqual(complexAttachments);
@@ -635,5 +979,328 @@ describe('ToolCall', () => {
       expect(liveRegion).not.toBeNull();
       expect(liveRegion!.className).toContain('sr-only');
     });
+  });
+});
+
+describe('ToolCall failure fast path', () => {
+  const failedProps = {
+    args: '{"url":"https://x"}',
+    name: 'fetch_page',
+    output: 'Error: tool call failed: HTTP 429 from github.com\nretry after 60',
+    initialProgress: 1,
+    isSubmitting: false,
+  };
+
+  it('spends the subtitle on the first line of the error', () => {
+    render(
+      <RecoilRoot>
+        <ToolCall {...failedProps} />
+      </RecoilRoot>,
+    );
+    expect(screen.getByTestId('subtitle')).toHaveTextContent('HTTP 429 from github.com');
+  });
+});
+
+describe('ToolCall sole tool disclosure', () => {
+  it('keeps the row of an only MCP call, the one place its function name shows', () => {
+    render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value>
+            <ToolCall
+              args='{"query":"weather"}'
+              name="search_documents_mcp_Workspace"
+              output="sunny"
+              initialProgress={1}
+              isSubmitting={false}
+            />
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    expect(screen.getByTestId('tool-call')).toBeInTheDocument();
+  });
+
+  it('drops its row when its group holds one call inside a phase of several', () => {
+    render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value={false}>
+            <LoneGroupContext.Provider value>
+              <ToolCall
+                args='{"query":"weather"}'
+                name="lookup"
+                output="sunny"
+                initialProgress={1}
+                isSubmitting={false}
+              />
+            </LoneGroupContext.Provider>
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    expect(screen.queryByTestId('tool-call')).not.toBeInTheDocument();
+    expect(screen.getByTestId('tool-call-info')).toBeInTheDocument();
+  });
+
+  it.each([['{}'], ['[]']])(
+    'keeps the row of an only call whose arguments are %s and output is empty',
+    (args) => {
+      render(
+        <RecoilRoot>
+          <MCPAppsPolicyProvider
+            startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+            ready
+            userId="user-1"
+          >
+            <SoleToolContext.Provider value>
+              <ToolCall
+                args={args}
+                name="lookup"
+                output=""
+                initialProgress={1}
+                isSubmitting={false}
+                runStepStatus="completed"
+              />
+            </SoleToolContext.Provider>
+          </MCPAppsPolicyProvider>
+        </RecoilRoot>,
+      );
+      expect(screen.getByTestId('tool-call')).toBeInTheDocument();
+    },
+  );
+
+  it('keeps the row of an only call whose output is only whitespace', () => {
+    render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value>
+            <ToolCall
+              args="{}"
+              name="lookup"
+              output={'  \n '}
+              initialProgress={1}
+              isSubmitting={false}
+              runStepStatus="completed"
+            />
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    expect(screen.getByTestId('tool-call')).toBeInTheDocument();
+  });
+
+  it('keeps the row of an only call whose output blocks render as empty text', () => {
+    render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value>
+            <ToolCall
+              args="{}"
+              name="lookup"
+              output={JSON.stringify([{ type: 'text', text: '  ' }])}
+              initialProgress={1}
+              isSubmitting={false}
+              runStepStatus="completed"
+            />
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    expect(screen.getByTestId('tool-call')).toBeInTheDocument();
+  });
+
+  it('keeps the row of an only call that is still running', () => {
+    render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value>
+            <ToolCall
+              args='{"query":"weather"}'
+              name="lookup"
+              output=""
+              initialProgress={0.5}
+              isSubmitting
+            />
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    expect(screen.getByTestId('tool-call')).toBeInTheDocument();
+  });
+
+  it('keeps the row of an only call that carries a model-authored intent', () => {
+    render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value>
+            <ToolCall
+              args='{"intent":"Look up the weather","query":"weather"}'
+              name="lookup"
+              output="sunny"
+              initialProgress={1}
+              isSubmitting={false}
+            />
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    expect(screen.getByTestId('tool-call')).toBeInTheDocument();
+  });
+
+  it('keeps the row of an only action call, which names the operation and domain', () => {
+    render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value>
+            <ToolCall
+              args='{"query":"weather"}'
+              name="get_weather_action_api---example---com"
+              output="sunny"
+              initialProgress={1}
+              isSubmitting={false}
+            />
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    expect(screen.getByTestId('tool-call')).toBeInTheDocument();
+  });
+
+  it('drops its own row once the only call has settled, leaving the info panel', () => {
+    render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value>
+            <ToolCall
+              args='{"query":"weather"}'
+              name="lookup"
+              output="sunny"
+              initialProgress={1}
+              isSubmitting={false}
+            />
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    expect(screen.queryByTestId('tool-call')).not.toBeInTheDocument();
+    expect(screen.getByTestId('tool-call-info')).toBeInTheDocument();
+  });
+
+  it('opens the only call of a group when it returned no output but has arguments', () => {
+    const { container } = render(
+      <RecoilRoot>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <SoleToolContext.Provider value>
+            <ToolCall
+              args='{"query":"weather"}'
+              name="lookup"
+              output=""
+              initialProgress={1}
+              isSubmitting={false}
+            />
+          </SoleToolContext.Provider>
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    const panel = container.querySelector('[style*="grid-template-rows"]') as HTMLElement;
+    expect(panel.style.gridTemplateRows).toBe('1fr');
+    expect(screen.getByTestId('tool-call-info')).toBeInTheDocument();
+  });
+
+  it('keeps the preference opening a call only once it has output', () => {
+    const { container } = render(
+      <RecoilRoot initializeState={({ set }) => set(store.autoExpandTools, true)}>
+        <MCPAppsPolicyProvider
+          startupConfig={{ mcpApps: { enabled: true } } as TStartupConfig}
+          ready
+          userId="user-1"
+        >
+          <ToolCall
+            args='{"query":"weather"}'
+            name="lookup"
+            output=""
+            initialProgress={1}
+            isSubmitting={false}
+          />
+        </MCPAppsPolicyProvider>
+      </RecoilRoot>,
+    );
+    const panel = container.querySelector('[style*="grid-template-rows"]') as HTMLElement;
+    expect(panel.style.gridTemplateRows).toBe('0fr');
+  });
+});
+
+describe('generated single-tool label', () => {
+  it.each(['search_documents_mcp_Workspace', 'get_weather_action_api---example---com', 'lookup'])(
+    'replaces the completed %s row with its panel',
+    (name) => {
+      render(
+        <RecoilRoot>
+          <GeneratedToolLabelContext.Provider value>
+            <ToolCall
+              name={name}
+              args='{"intent":"Check weather","query":"weather"}'
+              output="sunny"
+              initialProgress={1}
+              isSubmitting={false}
+            />
+          </GeneratedToolLabelContext.Provider>
+        </RecoilRoot>,
+      );
+      expect(screen.queryByTestId('tool-call')).not.toBeInTheDocument();
+    },
+  );
+  it('keeps the output available without a second disclosure', () => {
+    render(
+      <RecoilRoot>
+        <GeneratedToolLabelContext.Provider value>
+          <ToolCall
+            name="search_documents_mcp_Workspace"
+            args='{"query":"weather"}'
+            output="sunny"
+            initialProgress={1}
+            isSubmitting={false}
+          />
+        </GeneratedToolLabelContext.Provider>
+      </RecoilRoot>,
+    );
+    expect(screen.getByTestId('tool-call-info')).toBeInTheDocument();
   });
 });

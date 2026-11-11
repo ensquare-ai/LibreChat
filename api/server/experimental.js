@@ -37,13 +37,17 @@ const {
   initializeFileStorage,
   loadToolApprovalHooks,
   maybeInjectQueryDevtoolsBootstrap,
+  injectConfiguredFooterBootstrap,
+  injectColorModeHandoff,
+  readBundledThemeBoot,
+  createDeploymentThemeShell,
   preAuthTenantMiddleware,
   requestContextMiddleware,
   configureServerTimeouts,
   setupGracefulShutdown,
   registerShutdownTask,
-  getRemainingShutdownMs,
-  getShutdownElapsedMs,
+  getClusterShutdownBudgetMs,
+  registerBackgroundTaskShutdown,
   configureMessageFilterRegexValidator,
   configureFileConfigRegexEngine,
   configureAgentEventRuntime,
@@ -51,6 +55,10 @@ const {
   createAgentEventTerminalHandler,
   startCodeEnvironmentLifecycleReconciler,
   waitForKeyvRedisClient,
+  createCodeApiUploadRegistry,
+  cacheConfig,
+  createClusteredFileSweep,
+  createRequestSanitizer,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
@@ -58,6 +66,7 @@ const { capabilityContextMiddleware } = require('./middleware/roles/capabilities
 const createValidateImageRequest = require('./middleware/validateImageRequest');
 const { startExpiredFileSweep } = require('./services/Files/process');
 const { initializeGitHubSkillSync } = require('./services/Skills/sync');
+const { startSkillDeletionSweep } = require('./services/Skills/deletion');
 const { initializeAgentTriggerService } = require('./services/Agents/triggers');
 const { resumeAgentEventDetachedAction } = require('./services/Agents/detachedActionResume');
 const {
@@ -71,6 +80,7 @@ const {
   getRoleByName,
   updateAccessPermissions,
   seedDatabase,
+  recordAuditEntry,
   sweepOrphanedPreviews,
 } = require('~/models');
 const { checkMigrations } = require('./services/start/migration');
@@ -81,7 +91,6 @@ const { getAppConfig } = require('./services/Config');
 const staticCache = require('./utils/staticCache');
 const optionalJwtAuth = require('./middleware/optionalJwtAuth');
 const noIndex = require('./middleware/noIndex');
-const routes = require('./routes');
 const agentEventMethods = require('~/models');
 
 /** Route admin file-config MIME patterns through a linear-time engine (ReDoS-safe) on upload. */
@@ -356,10 +365,12 @@ if (cluster.isMaster) {
    * Each worker runs a full Express server instance
    */
   const app = express();
+  app.locals.codeApiUploadRegistry = createCodeApiUploadRegistry();
   // The clustered entrypoint deliberately does not arm the v1 schedule engine,
   // but an already-fired scheduled generation can still reach HITL here. Settle
   // its durable run when the generic approval runtime expires it.
   GenerationJobManager.setApprovalExpiredHandler(recordExpiredScheduleApproval);
+  GenerationJobManager.setAdmissionGuard(agentEventMethods.isAgentTriggerPrincipalActive);
   GenerationJobManager.setTerminalHostActionHandler(
     createAgentEventTerminalHandler(agentEventMethods, {
       resumeDetachedAction: resumeAgentEventDetachedAction,
@@ -381,36 +392,23 @@ if (cluster.isMaster) {
    *  after signalling. Measure against that, and hold back a reserve for the tasks after this
    *  one. Abandoning an unrecorded drain fences the next generation permanently. */
   const CLUSTER_TEARDOWN_RESERVE_MS = 3_000;
+  const clusterShutdownBudgetMs = () =>
+    getClusterShutdownBudgetMs({
+      deadlineAt: clusterShutdownDeadlineAt,
+      forceExitMs: CLUSTER_FORCE_EXIT_MS,
+    });
   const destroyGenerationJobManager = () => {
-    const remaining = getRemainingShutdownMs();
-    const elapsed = getShutdownElapsedMs();
-    if (remaining == null || elapsed == null) {
+    const budgetMs = clusterShutdownBudgetMs();
+    if (budgetMs == null) {
       return GenerationJobManager.destroy();
     }
-    /** Prefer the deadline the primary actually set. The elapsed-based estimate starts
-     *  counting only when this worker's signal handler ran, which lags the primary's timer
-     *  by however long the event loop was blocked. */
-    const primaryRemaining =
-      clusterShutdownDeadlineAt != null
-        ? clusterShutdownDeadlineAt - Date.now()
-        : CLUSTER_FORCE_EXIT_MS - elapsed;
     return GenerationJobManager.destroy({
-      settlementBudgetMs: Math.max(
-        0,
-        Math.min(remaining, primaryRemaining) - CLUSTER_TEARDOWN_RESERVE_MS,
-      ),
+      settlementBudgetMs: Math.max(0, budgetMs - CLUSTER_TEARDOWN_RESERVE_MS),
     });
   };
   // Tear down stream resources before shared caches and telemetry exporters shut down.
   registerShutdownTask('generation job manager', destroyGenerationJobManager, { priority: 100 });
-  /**
-   * The master may assign the sweep worker before or after this worker has
-   * loaded app config. These flags join the IPC assignment with config
-   * availability and ensure the background sweep starts only once.
-   */
-  let shouldStartExpiredFileSweep = false;
-  let expiredFileSweepOptions = null;
-  let expiredFileSweepStarted = false;
+  const expiredFileSweep = createClusteredFileSweep(cacheConfig.USE_REDIS, startExpiredFileSweep);
   const SCHEDULE_ENGINE_OPTIONAL_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'DELETE']);
 
   const rejectScheduleWritesUntilReady = (req, res, next) => {
@@ -421,15 +419,6 @@ if (cluster.isMaster) {
       code: 'SCHEDULES_NOT_SUPPORTED',
       error: 'Scheduled chats are not available in clustered mode.',
     });
-  };
-
-  const startExpiredFileSweepOnce = () => {
-    if (!shouldStartExpiredFileSweep || expiredFileSweepStarted || !expiredFileSweepOptions) {
-      return;
-    }
-
-    expiredFileSweepStarted = true;
-    startExpiredFileSweep(expiredFileSweepOptions);
   };
 
   /** Handle inter-process messages from master */
@@ -449,17 +438,14 @@ if (cluster.isMaster) {
   });
   process.on('message', (msg) => {
     if (msg.type === 'file-retention-sweep-worker') {
-      shouldStartExpiredFileSweep = true;
       logger.info(wrapLogMessage(`Worker ${process.pid} is assigned file-retention sweep`));
-      startExpiredFileSweepOnce();
+      expiredFileSweep.assign();
     }
   });
-
   const startServer = async () => {
     logger.info(`Worker ${process.pid} initializing...`);
 
     await waitForKeyvRedisClient();
-    await configureSubagentTaskRouting();
 
     if (typeof Bun !== 'undefined') {
       axios.defaults.headers.common['Accept-Encoding'] = 'gzip';
@@ -511,27 +497,41 @@ if (cluster.isMaster) {
       logger.error('[sweepOrphanedPreviews] Background sweep failed:', err);
     });
 
-    /** Initialize app configuration */
-    const appConfig = await getAppConfig();
+    /**
+     * Boot reads librechat.yaml only, as `server/index.js` does. File storage, skill sync and
+     * deletion, the expired-file sweep, tool-approval hooks and the other worker-wide settings
+     * below are fixed for the process lifetime, so DB `__base__` overrides must not decide them.
+     */
+    const appConfig = await getAppConfig({ baseOnly: true });
     initializeFileStorage(appConfig);
     initializeGitHubSkillSync(appConfig);
+    startSkillDeletionSweep(appConfig.skillDeletion);
     // Register configured tool-approval policy hooks (mirrors the standard startup path).
-    // Honors the `enabled` kill switch; hooks are base-config-only, registered process-wide.
-    // Read from the BASE config specifically — `appConfig` above (getAppConfig() with no
-    // principal) still merges DB `__base__` overrides, which must not drive which hook
-    // modules load in every worker (matches api/server/index.js's baseOnly usage).
-    const baseAppConfig = await getAppConfig({ baseOnly: true });
-    configureAgentEventRuntime(baseAppConfig?.endpoints?.agents?.eventDriven);
-    const toolApproval = baseAppConfig?.endpoints?.agents?.toolApproval;
+    // Honors the `enabled` kill switch; hooks are registered process-wide.
+    await configureSubagentTaskRouting(appConfig?.endpoints?.agents?.subagentActivity);
+    registerBackgroundTaskShutdown({
+      interruptGraceMs: appConfig?.endpoints?.agents?.backgroundTasks?.shutdownInterruptGraceMs,
+      getBudgetMs: clusterShutdownBudgetMs,
+    });
+    configureAgentEventRuntime(appConfig?.endpoints?.agents?.eventDriven);
+    const toolApproval = appConfig?.endpoints?.agents?.toolApproval;
     await loadToolApprovalHooks(toolApproval?.enabled ? toolApproval.hooks : undefined, {
       basePath: path.resolve(__dirname, '../..'),
     });
-    expiredFileSweepOptions = { appConfig, loadAppConfig: getAppConfig };
-    startExpiredFileSweepOnce();
+    expiredFileSweep.configure({ appConfig, loadAppConfig: getAppConfig });
     await runAsSystem(async () => {
       await performStartupChecks(appConfig);
-      await updateInterfacePerms({ appConfig, getRoleByName, updateAccessPermissions });
+      await updateInterfacePerms({
+        appConfig,
+        getRoleByName,
+        updateAccessPermissions,
+        recordAuditEntry,
+      });
     });
+
+    /* Route modules build their rate limiters as they load, so they load only after the
+     * startup checks have applied `rateLimits` from librechat.yaml. */
+    const routes = require('./routes');
 
     /** Load index.html for SPA serving */
     const indexPath = path.join(appConfig.paths.dist, 'index.html');
@@ -549,6 +549,22 @@ if (cluster.isMaster) {
       }
     }
 
+    /* The composer lays out against whether a footer bar sits beneath it, and
+       `/api/config` answers that only after it has painted. One shell serves
+       every request, before there is a caller whose overrides could be resolved,
+       so the answer is the deployment's base configuration, like index.js. */
+    indexHTML = injectConfiguredFooterBootstrap(indexHTML, {
+      customFooter: process.env.CUSTOM_FOOTER,
+      landingFooter: appConfig?.interfaceConfig?.landingFooter,
+    });
+
+    indexHTML = injectColorModeHandoff(indexHTML, appConfig?.interfaceConfig?.colorModeFromUrl);
+    const indexShell = createDeploymentThemeShell(
+      indexHTML,
+      appConfig?.interfaceConfig?.theme,
+      readBundledThemeBoot(appConfig.paths.dist),
+    );
+
     const cspPolicy = createCspPolicy();
     const shellCache = shellCacheHeaders(cspPolicy != null);
 
@@ -558,7 +574,10 @@ if (cluster.isMaster) {
 
       const lang = req.cookies.lang || req.headers['accept-language']?.split(',')[0] || 'en-US';
       const saneLang = escapeHtmlAttribute(lang);
-      let updatedIndexHtml = indexHTML.replace(/lang="en-US"/g, () => `lang="${saneLang}"`);
+      let updatedIndexHtml = indexShell(req, res).replace(
+        /lang="en-US"/g,
+        () => `lang="${saneLang}"`,
+      );
       updatedIndexHtml = maybeInjectQueryDevtoolsBootstrap(updatedIndexHtml, req);
 
       /* Nonce last: every injected script above must be stamped too. */
@@ -596,7 +615,7 @@ if (cluster.isMaster) {
       next();
     });
 
-    app.use(mongoSanitize());
+    app.use(createRequestSanitizer(mongoSanitize));
     app.use(cors());
     app.use(cookieParser());
 
@@ -626,7 +645,7 @@ if (cluster.isMaster) {
     }
 
     if (isEnabled(ALLOW_SOCIAL_LOGIN)) {
-      await configureSocialLogins(app);
+      await configureSocialLogins(app, appConfig);
     }
 
     app.use(capabilityContextMiddleware);
@@ -646,6 +665,7 @@ if (cluster.isMaster) {
     app.use('/api/search', routes.search);
     app.use('/api/messages', routes.messages);
     app.use('/api/convos', routes.convos);
+    app.use('/api/pull-requests', preAuthTenantMiddleware, routes.pullRequests);
     app.use('/api/presets', routes.presets);
     app.use('/api/projects', routes.projects);
     app.use('/api/prompts', routes.prompts);
@@ -673,6 +693,8 @@ if (cluster.isMaster) {
     app.use('/api/permissions', routes.accessPermissions);
     app.use('/api/tags', routes.tags);
     app.use('/api/mcp', routes.mcp);
+
+    app.use('/api', routes.openapi);
 
     /** 404 for unmatched API routes */
     app.use('/api', apiNotFound);
@@ -708,7 +730,16 @@ if (cluster.isMaster) {
         await initializeMCPs();
         await initializeOAuthReconnectManager();
         await checkMigrations();
-        await initializeAgentTriggerService({ address: server.address() });
+        await initializeAgentTriggerService({
+          address: server.address(),
+          completionResultBatchSize:
+            appConfig?.endpoints?.agents?.backgroundTasks?.completionResultBatchSize,
+          completionReceiptBatching:
+            appConfig?.endpoints?.agents?.backgroundTasks?.completionReceiptBatching,
+          deadLetterRetentionDays:
+            appConfig?.endpoints?.agents?.eventDriven?.deadLetterRetentionDays,
+          idlePolling: appConfig?.endpoints?.agents?.eventDriven?.idlePolling,
+        });
       } catch (initErr) {
         logger.error(`Worker ${process.pid} post-listen initialization failed:`, initErr);
         process.exit(1);

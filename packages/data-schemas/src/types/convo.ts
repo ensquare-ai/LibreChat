@@ -1,4 +1,9 @@
-import type { TSubagentThreadLineage } from 'librechat-data-provider';
+import type {
+  CodeApprovalMode,
+  CodeEnvironmentMode,
+  CodeWorkspaceSelection,
+  TSubagentThreadLineage,
+} from 'librechat-data-provider';
 import type { Document, Types } from 'mongoose';
 import type { ICompactionSemanticIndexProjection } from './compaction';
 
@@ -7,6 +12,27 @@ export const MAX_AGENT_EVENT_ACTOR_DISCOVERED_TOOLS = 128;
 export const MAX_AGENT_EVENT_ACTOR_TOOL_NAME_LENGTH = 512;
 export const MAX_AGENT_EVENT_ACTOR_SUMMARY_LENGTH = 1_000_000;
 export const MAX_AGENT_EVENT_ACTOR_ENCODING_LENGTH = 128;
+/**
+ * Provenance of a stored event-actor summary. States written before this
+ * version kept only `{ text, tokenCount }`, so a round that failed or never
+ * finished is indistinguishable from a checkpoint once persisted. A restore
+ * requires the current version, which is what lets a warm continuation trust
+ * the summary instead of rebuilding from durable history.
+ */
+export const AGENT_EVENT_ACTOR_SUMMARY_VERSION = 1;
+
+/** Branch and head commit the conversation's code lane last reported; null when it has none. */
+export interface IConversationLaneGit {
+  branch: string | null;
+  head: string | null;
+  /** `owner/name` of the lane's repository, as its worker registered it. */
+  repo?: string;
+  /** A pull request of `repo` a command's output linked to while the lane was on `branch`. Kept
+   *  across later reports on the same branch and repository, dropped when either changes. */
+  pullRequest?: number;
+  /** Reserved sequence number; internal, never returned by `getConvoLaneGit`. */
+  seq?: number;
+}
 
 export interface ISubagentThreadLease {
   token: string;
@@ -43,6 +69,8 @@ export interface IAgentEventActorSkillIdentity {
 export interface IAgentEventActorSummary {
   text: string;
   tokenCount: number;
+  /** {@link AGENT_EVENT_ACTOR_SUMMARY_VERSION}; absent on pre-version states. */
+  version?: number;
 }
 
 /**
@@ -52,7 +80,8 @@ export interface IAgentEventActorSummary {
  * for prefix-based provider prompt caches. Graph messages stay canonical.
  */
 export interface IAgentFadingTier {
-  v: 1;
+  /** Version 1 is readable but must not seed a version 2 SDK run. */
+  v: 1 | 2;
   /** Token budget the caps derive from; never grows within a conversation. */
   budgetTokens: number;
   /** Whether observation masking has activated. */
@@ -188,7 +217,8 @@ export interface IAgentEventActorSuspension {
   handlingGenerationCreatedAt?: number;
   actionId: string;
   jobCreatedAt: number;
-  status: 'pending' | 'claimed' | 'closed';
+  /** Owned states fence legacy replicas; snapshot readers expose pending/claimed. */
+  status: 'pending' | 'claimed' | 'pending_owned' | 'claimed_owned' | 'closed';
   resumeAttemptId?: string;
   outcome?: 'committed' | 'stale' | 'settled' | 'cancelled';
   closedAt?: Date;
@@ -233,6 +263,8 @@ export interface ISubagentThreadReservation {
 export interface IConversation extends Document {
   conversationId: string;
   title?: string;
+  titleSetByUser?: boolean;
+  titleRevision?: number;
   user?: string;
   messages?: Types.ObjectId[];
   isTemporary?: boolean;
@@ -264,6 +296,19 @@ export interface IConversation extends Document {
   resendFiles?: boolean;
   imageDetail?: string;
   agent_id?: string;
+  codeApprovalMode?: CodeApprovalMode;
+  /** Private fence advanced when an admitted generation reads its decision. */
+  codeEnvironmentRevision?: number;
+  codeEnvironmentMode?: CodeEnvironmentMode;
+  codeWorkspaces?: CodeWorkspaceSelection[];
+  /** Exact tool names auto-approved for this conversation; server-written only. */
+  toolApprovalAllows?: string[];
+  /** Last lane branch and head a command reported; server-written only and excluded from reads. */
+  laneGit?: IConversationLaneGit;
+  /** Counter behind `laneGit.seq`; server-written only and excluded from reads. */
+  laneGitSeq?: number;
+  /** Moves and detaches of the workspace; fences lane reports from an earlier attachment. */
+  codeAttachmentEpoch?: number;
   /** Immutable primary persisted-agent attribution for Insights. */
   initial_agent_id?: string | null;
   subagentThread?: TSubagentThreadLineage;
@@ -273,6 +318,8 @@ export interface IConversation extends Document {
   agentEventBinding?: IAgentEventBinding;
   /** Internal event-actor checkpoint head. Excluded from ordinary conversation reads. */
   agentEventActor?: IAgentEventActorState;
+  /** Prune work persisted atomically before the actor rotates its predecessor. */
+  agentEventActorCleanup?: IAgentEventActorCheckpoint[];
   /** Private invocation proof: active lifecycle fences plus settled same-ID receipts. */
   agentEventActorReconciliations?: IAgentEventActorReconciliation[];
   /** Private invalidation epoch; see {@link IAgentEventActorSnapshot.epoch}. */
@@ -290,6 +337,9 @@ export interface IConversation extends Document {
   pinned?: boolean;
   /** Derived per request from the shared-links collection; never persisted on the conversation. */
   isShared?: boolean;
+  /** Derived per list request: this replica listed the row's code decision, so an absent decision
+   *  means an ordinary chat rather than a server that does not say. Never persisted. */
+  codeDecisionListed?: boolean;
   iconURL?: string;
   greeting?: string;
   spec?: string;
@@ -314,4 +364,14 @@ export interface IConversation extends Document {
   createdAt?: Date;
   updatedAt?: Date;
   tenantId?: string;
+  /** Set only when an assistant message is persisted, never by title generation or metadata edits. */
+  lastResponseAt?: Date;
+  /** Durable messageId of the assistant reply named by `lastResponseAt`. */
+  lastResponseMessageId?: string;
+  /** True only while `lastResponseAt` is the synthetic marker from "mark unread". */
+  lastResponseIsManual?: boolean;
+  /** True: manual reminder; false: real reply; absent: legacy/unknown intent. */
+  isMarkedUnread?: boolean;
+  /** Read acknowledgement; epoch is the explicit unseen-reply watermark. */
+  lastSeenAt?: Date;
 }
